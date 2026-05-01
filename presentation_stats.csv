@@ -1,0 +1,5 @@
+Mode,Avg Tokens/Sec,Avg Time (s),Accuracy %
+QUANTIZED,2.86,5.20,100
+NAIVE,0.16,64.16,100
+ORACLE,0.29,37.68,100
+PREDICTOR,0.86,14.19,50

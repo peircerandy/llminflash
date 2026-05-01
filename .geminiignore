@@ -1,0 +1,13 @@
+# Ignore large model files
+*.bin
+*.pt
+*.safetensors
+*.onnx
+
+# Ignore build artifacts
+flash_engine
+*.o
+
+# Ignore conda environments
+envs/
+.conda/
