@@ -1,50 +1,86 @@
 # LLM in a Flash (Implementation)
 
-This repository contains an implementation of the "LLM in a Flash: Efficient Out-of-Memory Inference" paper, which enables running large language models (LLMs) on devices with limited memory by efficiently offloading weights and using sparse activation prediction.
+An implementation of the "LLM in a Flash: Efficient Out-of-Memory Inference" research paper by Apple researchers. This project enables running Large Language Models (LLMs) on devices with memory constraints by efficiently offloading weights and using sparse activation prediction.
 
-## Project Overview
+## 🚀 Overview
 
-The project uses a hybrid C++/Python approach:
-- **C++ Engine:** Handles high-performance FFN (Feed-Forward Network) execution and efficient memory management.
-- **Python Layer:** Manages model loading (using HuggingFace Transformers), predictor training, and high-level inference logic.
-- **Sparse Predictor:** A low-rank neural network that predicts which neurons in the FFN will activate, reducing the amount of data that needs to be loaded from storage.
+The "LLM in a Flash" approach addresses the bottleneck of limited DRAM when running large models. It treats flash memory as the primary storage and uses two key techniques:
+1.  **Windowing:** Reducing data transfer by reusing previously activated neurons.
+2.  **Sparse Activation Prediction:** Using a low-rank predictor to guess which neurons in the Feed-Forward Network (FFN) will activate, loading only the necessary weights.
 
-## Key Components
+This repository provides a hybrid C++/Python implementation designed for the OPT-6.7B model architecture.
 
-- `engine.cpp`: The core C++ engine for executing FFN layers.
-- `chat.py`: The main entry point for interacting with the model.
-- `train_predictor.py`: Script to train the low-rank activation predictors.
-- `bundle_ffn.py`: Utility to prepare and bundle FFN weights for the C++ engine.
-- `preprocessing.py`: Data preprocessing for training.
-- `test_inference.py`: Verification script for model output.
-- `Makefile`: Build configuration for the C++ library.
+## 🛠 Architecture
 
-## Getting Started
+### C++ Engine (`engine.cpp`)
+A high-performance backend responsible for:
+- Efficient memory-mapped I/O for weight loading.
+- Parallelized FFN execution using OpenMP.
+- Optimized matrix operations for sparse activations.
+
+### Python Layer
+- **`chat.py`**: Interactive CLI for model inference.
+- **`train_predictor.py`**: Trains the `LowRankPredictor` (the "sparse predictor") using a bottleneck architecture (4096 -> 128 -> 16384).
+- **`bundle_ffn.py`**: Pre-processes and bundles FFN weights into a custom binary format for the C++ engine.
+
+## 📦 Getting Started
 
 ### Prerequisites
+- **Compiler:** `g++` with OpenMP support.
+- **Python:** 3.8+
+- **Hardware:** Works best on systems where model weights exceed available GPU/System RAM.
 
-- Python 3.8+
-- PyTorch
-- HuggingFace Transformers & Accelerate
-- G++ with OpenMP support
+### Installation
 
-### Building the C++ Engine
+1.  **Clone the repository:**
+    ```bash
+    git clone git@github.com:peircerandy/llminflash.git
+    cd llminflash
+    ```
 
+2.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+3.  **Build the C++ Engine:**
+    ```bash
+    make
+    ```
+
+## 📖 Usage
+
+### 1. Data Preprocessing
+Prepare your training data for the sparse predictor:
 ```bash
-make
+python preprocessing.py
 ```
-This will generate `libengine.so`, which is used by the Python layer via `ctypes`.
 
-### Usage
+### 2. Training the Predictors
+Train the low-rank neural networks that predict neuron activation:
+```bash
+python train_predictor.py
+```
 
-1. **Prepare the model:** Bundle the FFN weights.
-2. **Train the predictor:** Use `train_predictor.py` to create the sparse activation models.
-3. **Run inference:** Use `chat.py` or `test_inference.py`.
+### 3. Bundling Weights
+Bundle the OPT-6.7B FFN weights for use with the flash engine:
+```bash
+python bundle_ffn.py
+```
 
-## References
+### 4. Running Inference
+Run the model in an interactive session:
+```bash
+python chat.py
+```
 
-- [LLM in a Flash: Efficient Out-of-Memory Inference](LLMinaFlash.pdf) (Original Paper)
+## 📊 Performance & Accuracy
+- Performance metrics can be generated using `speed_test.py`.
+- Accuracy verification is handled by `benchmark_accuracy.py`.
 
-## License
+## 📚 References
+- **Original Paper:** [LLM in a Flash: Efficient Out-of-Memory Inference](LLMinaFlash.pdf) (Alizadeh et al., 2023)
+- **Model Architecture:** Facebook/Meta OPT-6.7B
 
-*Specify your license here (e.g., MIT, Apache 2.0).*
+## ⚖️ License
+This project is licensed under the [MIT License](LICENSE).
