@@ -20,6 +20,7 @@ CACHE_PATH = "/mnt/wsl/PHYSICALDRIVE0p3/hf_cache"
 OFFLOAD_PATH = "/mnt/wsl/PHYSICALDRIVE0p3/hf_offload"
 FFN_BIN_PATH = b"/mnt/wsl/PHYSICALDRIVE0p3/opt_6_7b_bundled_ffn.bin"
 HIDDEN_SIZE = 4096
+DEVICE = "cuda:0"
 
 # --- C++ Engine Bindings ---
 lib = ctypes.CDLL(os.path.abspath("./libengine.so"))
@@ -145,6 +146,12 @@ class StreamAndTimer:
         pass
 
 def chat(mode_name):
+    # SSD Check
+    if not os.path.exists(FFN_BIN_PATH.decode()):
+        print(f"CRITICAL ERROR: NVMe SSD weights not found at {FFN_BIN_PATH.decode()}")
+        print("Please check if your PHYSICALDRIVE0p3 is mounted to /mnt/wsl/")
+        sys.exit(1)
+
     print(f"Initializing {mode_name.upper()} Mode...")
     
     if mode_name == "quantized":
@@ -163,6 +170,7 @@ def chat(mode_name):
             local_files_only=True
         )
         engine_ptr = None
+        assistant_model = None
 
     elif mode_name == "standard":
         # STANDARD MODE: No C++, no tricks. Just pure PyTorch memory limits.
@@ -177,12 +185,31 @@ def chat(mode_name):
             local_files_only=True
         )
         engine_ptr = None
+        assistant_model = None
         
     else:
-        # APPLE ARCHITECTURES: Oracle, Predictor, or Naive
+        # APPLE ARCHITECTURES: Oracle, Predictor, Naive, Speculative_HF, or Speculative_Custom
+        print("Initializing C++ Flash Engine with Sliding Window (k=5)...")
         engine_ptr = lib.init_engine(FFN_BIN_PATH)
-        mode_map = {"predictor": 0, "oracle": 1, "naive": 2}
+        mode_map = {
+            "predictor": 0, 
+            "oracle": 1, 
+            "naive": 2, 
+            "speculative_hf": 0, 
+            "speculative_custom": 0 
+        }
         mode_int = mode_map[mode_name]
+
+        if mode_name in ["speculative_hf", "speculative_custom"]:
+            print("Loading 125M Draft Model for Speculative Decoding...")
+            assistant_model = OPTForCausalLM.from_pretrained(
+                "facebook/opt-125m", 
+                device_map="auto",
+                cache_dir=CACHE_PATH,
+                local_files_only=True
+            )
+        else:
+            assistant_model = None
 
         custom_device_map = {
             "model.decoder.embed_tokens": "cuda:0",
@@ -239,15 +266,64 @@ def chat(mode_name):
             timer_streamer.start()
             
             try:
-                # We pass the streamer directly into the generate function!
-                outputs = model.generate(
-                    **inputs, 
-                    max_new_tokens=15, 
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id, # REVERTED: Let the model stop on its natural <EOS> token!
-                    streamer=timer_streamer # Streams live text AND the spinning timer
-                )
-                elapsed_time, gen_tokens = timer_streamer.stop()
+                if mode_name == "speculative_custom":
+                    # --- Section 5.2: Custom Speculative Decoding Loop ---
+                    K = 4
+                    input_ids = inputs.input_ids
+                    current_input_ids = input_ids
+                    
+                    while True:
+                        # 1. Draft K tokens
+                        draft_ids = current_input_ids
+                        for _ in range(K):
+                            with torch.no_grad():
+                                draft_outputs = assistant_model(draft_ids)
+                                next_id = torch.argmax(draft_outputs.logits[:, -1, :], dim=-1).unsqueeze(0)
+                                draft_ids = torch.cat([draft_ids, next_id], dim=-1)
+                        
+                        # 2. Verify in Batch
+                        with torch.no_grad():
+                            main_outputs = model(draft_ids)
+                            main_logits = main_outputs.logits
+                        
+                        # 3. Check acceptance
+                        accepted_ids = []
+                        n_orig = current_input_ids.shape[1]
+                        
+                        for j in range(K):
+                            drafted_token = draft_ids[0, n_orig + j]
+                            main_pred_token = torch.argmax(main_logits[0, n_orig + j - 1, :], dim=-1)
+                            
+                            if drafted_token == main_pred_token:
+                                accepted_ids.append(drafted_token)
+                                timer_streamer.put(drafted_token)
+                            else:
+                                accepted_ids.append(main_pred_token)
+                                timer_streamer.put(main_pred_token)
+                                break
+                        
+                        # Update sequence
+                        accepted_tensor = torch.tensor([accepted_ids], device=DEVICE)
+                        current_input_ids = torch.cat([current_input_ids, accepted_tensor], dim=-1)
+                        
+                        if any(tid == tokenizer.eos_token_id for tid in accepted_ids): break
+                        if (current_input_ids.shape[1] - input_ids.shape[1]) >= 30: break
+
+                    elapsed_time, gen_tokens = timer_streamer.stop()
+
+                else:
+                    # STANDARD HF GENERATION (Supports speculative_hf)
+                    gen_kwargs = {
+                        "max_new_tokens": 15,
+                        "pad_token_id": tokenizer.eos_token_id,
+                        "eos_token_id": tokenizer.eos_token_id,
+                        "streamer": timer_streamer
+                    }
+                    if mode_name == "speculative_hf":
+                        gen_kwargs["assistant_model"] = assistant_model
+                    
+                    outputs = model.generate(**inputs, **gen_kwargs)
+                    elapsed_time, gen_tokens = timer_streamer.stop()
                 
             except KeyboardInterrupt:
                 # Graceful interrupt catches early stops AND retrieves current metrics
@@ -285,11 +361,13 @@ if __name__ == "__main__":
                "  oracle    : C++ Sparse Streaming with Exact Math (Accurate, slow)\n"
                "  naive     : C++ reading 100% of SSD (Apple's Baseline)\n"
                "  standard  : Vanilla Hugging Face (Python disk swapping)\n"
-               "  quantized : 4-Bit RAM Compression (GPT4All style)",
+               "  quantized : 4-Bit RAM Compression (GPT4All style)\n"
+               "  speculative_hf : Speculative Decoding (HF Built-in)\n"
+               "  speculative_custom : Speculative Decoding (Custom Loop)",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
-    valid_modes = ['predictor', 'oracle', 'naive', 'standard', 'quantized']
+    valid_modes = ['predictor', 'oracle', 'naive', 'standard', 'quantized', 'speculative_hf', 'speculative_custom']
     
     parser.add_argument(
         '--mode', 

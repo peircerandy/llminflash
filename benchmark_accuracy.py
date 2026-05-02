@@ -8,6 +8,7 @@ import os
 import time
 import gc
 import logging
+import argparse
 
 # --- Suppress HF Warnings safely ---
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -20,6 +21,7 @@ CACHE_PATH = "/mnt/wsl/PHYSICALDRIVE0p3/hf_cache"
 OFFLOAD_PATH = "/mnt/wsl/PHYSICALDRIVE0p3/hf_offload"
 FFN_BIN_PATH = b"/mnt/wsl/PHYSICALDRIVE0p3/opt_6_7b_bundled_ffn.bin"
 HIDDEN_SIZE = 4096
+DEVICE = "cuda:0"
 
 # --- C++ Engine Bindings ---
 lib = ctypes.CDLL(os.path.abspath("./libengine.so"))
@@ -79,17 +81,17 @@ def generate_graph(results):
     accuracies = [results[m]["accuracy_pct"] for m in modes]
     times = [results[m]["avg_time"] for m in modes]
 
-    plt.figure(figsize=(11, 7))
+    plt.figure(figsize=(12, 8))
     
     # Use distinct colors for each architecture
-    colors = ['#ffcc99', '#99ccff', '#ff9999', '#c2c2f0']
+    colors = ['#ffcc99', '#99ccff', '#ff9999', '#c2c2f0', '#b3e2cd', '#fdcdac']
     bars = plt.bar([m.upper() for m in modes], speeds, color=colors[:len(modes)])
     
     plt.title('Hardware Architecture Performance vs. Accuracy (OPT-6.7B)', fontsize=15, fontweight='bold', pad=20)
     plt.ylabel('Tokens Per Second (Higher is Better)', fontsize=12)
     
     # Dynamically increase the Y-axis ceiling so our new, taller text blocks don't get cut off
-    plt.ylim(0, max(speeds) * 1.35)
+    plt.ylim(0, max(speeds) * 1.45)
     
     # Get the baseline speed (Naive mode) to calculate the speedup multipliers
     baseline_speed = results.get("naive", {}).get("avg_tps", 0)
@@ -109,9 +111,9 @@ def generate_graph(results):
                 speedup_str = f"\n({multiplier:.2f}x Speedup)"
 
         # EXPLICIT LABELING: Now includes the mathematical multiplier!
-        label = f"{yval:.2f} Tokens/Sec{speedup_str}\nTime: {t:.1f}s\nAcc: {acc}%"
+        label = f"{yval:.2f} TPS{speedup_str}\nTime: {t:.1f}s\nAcc: {acc}%"
         
-        plt.text(bar.get_x() + bar.get_width()/2, yval + offset, label, ha='center', va='bottom', fontweight='bold', fontsize=10)
+        plt.text(bar.get_x() + bar.get_width()/2, yval + offset, label, ha='center', va='bottom', fontweight='bold', fontsize=9)
 
     plt.tight_layout()
     plt.savefig('presentation_benchmark.png', dpi=300)
@@ -120,7 +122,6 @@ def generate_graph(results):
     import csv
     with open('presentation_stats.csv', 'w', newline='') as f:
         writer = csv.writer(f)
-        # EXPLICIT LABELING: Spelled out Tokens/Sec in the spreadsheet header
         writer.writerow(['Mode', 'Avg Tokens/Sec', 'Avg Time (s)', 'Accuracy %'])
         for m in modes:
             writer.writerow([m.upper(), f"{results[m]['avg_tps']:.2f}", f"{results[m]['avg_time']:.2f}", results[m]['accuracy_pct']])
@@ -129,17 +130,19 @@ def generate_graph(results):
     print("Raw statistics saved to 'presentation_stats.csv'!")
 
 def run_suite():
+    # SSD Check
+    if not os.path.exists(FFN_BIN_PATH.decode()):
+        print(f"CRITICAL ERROR: NVMe SSD weights not found at {FFN_BIN_PATH.decode()}")
+        print("Please check if your PHYSICALDRIVE0p3 is mounted to /mnt/wsl/")
+        sys.exit(1)
+
     print("==================================================")
     print(" LLM IN A FLASH - AUTOMATED ACCURACY BENCHMARK ")
     print("==================================================\n")
     
-    # We skip "standard" because OS disk swapping will likely crash your laptop.
-    # But we added "naive" back in to show Apple's baseline vs the optimizations!
-    modes_to_test = ["quantized", "naive", "oracle", "predictor"]
+    modes_to_test = ["quantized", "naive", "oracle", "predictor", "speculative_hf", "speculative_custom"]
     
-    # Dictionary to store results for graphing
     benchmark_results = {}
-    # NEW: Store the table rows to print cleanly at the very end
     summary_table_rows = []
 
     for mode_name in modes_to_test:
@@ -149,11 +152,12 @@ def run_suite():
         
         tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH, local_files_only=True)
         engine_ptr = None
+        assistant_model = None
 
         if mode_name == "quantized":
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16 # CRITICAL FIX: Stabilizes 4-bit CUDA math
+                bnb_4bit_compute_dtype=torch.float16
             )
             model = OPTForCausalLM.from_pretrained(
                 MODEL_ID, quantization_config=bnb_config, device_map="auto",
@@ -161,8 +165,22 @@ def run_suite():
             )
         else:
             engine_ptr = lib.init_engine(FFN_BIN_PATH)
-            # CRITICAL FIX: Add the 'naive' mode integer mapping so the C++ engine knows what to do
-            mode_int = {"predictor": 0, "oracle": 1, "naive": 2}[mode_name]
+            mode_int = {
+                "predictor": 0, 
+                "oracle": 1, 
+                "naive": 2,
+                "speculative_hf": 0,
+                "speculative_custom": 0
+            }[mode_name]
+
+            if mode_name in ["speculative_hf", "speculative_custom"]:
+                print("Loading 125M Draft Model for Speculative Decoding...")
+                assistant_model = OPTForCausalLM.from_pretrained(
+                    "facebook/opt-125m", 
+                    device_map="auto",
+                    cache_dir=CACHE_PATH,
+                    local_files_only=True
+                )
 
             custom_map = {"model.decoder.embed_tokens": "cuda:0", "model.decoder.embed_positions": "cuda:0", "model.decoder.final_layer_norm": "cuda:0", "lm_head": "cuda:0"}
             for i in range(32):
@@ -199,59 +217,73 @@ def run_suite():
             inputs = tokenizer(q["prompt"], return_tensors="pt").to(model.device)
             
             start_time = time.time()
-            # Force exact 10 token limit and deterministic greedy search for standardized benchmarking
-            outputs = model.generate(
-                **inputs, 
-                max_new_tokens=10, 
-                pad_token_id=tokenizer.eos_token_id,
-                do_sample=False # CRITICAL FIX: Forces deterministic output and prevents sampling crashes
-            )
+            if mode_name == "speculative_custom":
+                # Manual loop for custom speculative mode
+                K = 4
+                current_input_ids = inputs.input_ids
+                generated_ids = []
+                while len(generated_ids) < 10:
+                    draft_ids = current_input_ids
+                    for _ in range(K):
+                        with torch.no_grad():
+                            draft_outputs = assistant_model(draft_ids)
+                            next_id = torch.argmax(draft_outputs.logits[:, -1, :], dim=-1).unsqueeze(0)
+                            draft_ids = torch.cat([draft_ids, next_id], dim=-1)
+                    with torch.no_grad():
+                        main_outputs = model(draft_ids)
+                        main_logits = main_outputs.logits
+                    accepted_round = []
+                    n_orig = current_input_ids.shape[1]
+                    for j in range(K):
+                        drafted_token = draft_ids[0, n_orig + j]
+                        main_pred_token = torch.argmax(main_logits[0, n_orig + j - 1, :], dim=-1)
+                        if drafted_token == main_pred_token:
+                            accepted_round.append(drafted_token)
+                        else:
+                            accepted_round.append(main_pred_token)
+                            break
+                    generated_ids.extend(accepted_round)
+                    accepted_tensor = torch.tensor([accepted_round], device=model.device)
+                    current_input_ids = torch.cat([current_input_ids, accepted_tensor], dim=-1)
+                    if any(tid == tokenizer.eos_token_id for tid in accepted_round): break
+                generated_ids = torch.tensor(generated_ids[:10], device=model.device)
+            else:
+                gen_kwargs = {"max_new_tokens": 10, "pad_token_id": tokenizer.eos_token_id, "do_sample": False}
+                if mode_name == "speculative_hf": gen_kwargs["assistant_model"] = assistant_model
+                outputs = model.generate(**inputs, **gen_kwargs)
+                generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+
             elapsed = time.time() - start_time
-            
-            # Extract only the newly generated text
-            generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
             generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-            
-            # NEW: Print the exact text output like chat.py!
             print(f"\nOPT [{mode_name.upper()}]: {generated_text}")
             
             tps = 10 / elapsed
             mode_total_tps += tps
             mode_total_time += elapsed
             
-            # Check accuracy
             is_accurate = "PASS" if q["expected"].lower() in generated_text.lower() else "FAIL"
-            if is_accurate == "PASS":
-                mode_passes += 1
-            
-            # Save the result to print at the end of the script
+            if is_accurate == "PASS": mode_passes += 1
             row = f"| {mode_name.upper():<12} | {q['desc']:<16} | {is_accurate:<10} | {tps:<10.2f} | {elapsed:<10.2f} |"
             summary_table_rows.append(row)
 
-        # Save aggregate results for this mode
         avg_tps = mode_total_tps / len(TEST_QUESTIONS)
         avg_time = mode_total_time / len(TEST_QUESTIONS)
         accuracy_pct = int((mode_passes / len(TEST_QUESTIONS)) * 100)
         benchmark_results[mode_name] = {"avg_tps": avg_tps, "accuracy_pct": accuracy_pct, "avg_time": avg_time}
 
-        # Memory cleanup between mode switches
         del model
-        if engine_ptr:
-            lib.destroy_engine(engine_ptr)
+        if assistant_model: del assistant_model
+        if engine_ptr: lib.destroy_engine(engine_ptr)
         gc.collect()
         torch.cuda.empty_cache()
 
-    # NEW: Print the final beautiful summary table once all tests are completely finished!
     print("\n\n==================================================")
     print(" FINAL BENCHMARK SUMMARY TABLE ")
     print("==================================================")
     print(f"| {'Mode':<12} | {'Test Type':<16} | {'Accuracy':<10} | {'Tokens/Sec':<10} | {'Time (s)':<10} |")
     print("-" * 75)
-    for row in summary_table_rows:
-        print(row)
+    for row in summary_table_rows: print(row)
     print("-" * 75)
-
-    # After testing all modes, generate the graph and CSV!
     generate_graph(benchmark_results)
 
 if __name__ == "__main__":
