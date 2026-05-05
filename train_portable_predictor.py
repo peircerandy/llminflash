@@ -233,10 +233,16 @@ sentinel-1-rtc:
                 if img is None:
                     print(f"\nWarning: Sample {i} has no recognizable image field. Skipping.")
                     continue
+
+                # Handle different data types (PIL, List, Tensor)
+                if isinstance(img, list):
+                    img = torch.tensor(img).float()
                 
-                # If it's already a tensor (from some datasets), just use it, else preprocess
                 if not isinstance(img, torch.Tensor):
-                    img = preprocess(img.convert("RGB")).unsqueeze(0).to("cuda")
+                    if hasattr(img, "convert"):
+                        img = preprocess(img.convert("RGB")).unsqueeze(0).to("cuda")
+                    else:
+                        img = torch.tensor(img).float().unsqueeze(0).to("cuda")
                 else:
                     # EuroSAT MS might be (B, C, H, W) or (C, H, W)
                     if img.dim() == 3: img = img.unsqueeze(0)
