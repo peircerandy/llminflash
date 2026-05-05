@@ -236,8 +236,22 @@ sentinel-1-rtc:
                 if not isinstance(img, torch.Tensor):
                     img = preprocess(img.convert("RGB")).unsqueeze(0).to("cuda")
                 else:
-                    img = img.unsqueeze(0).to("cuda")
+                    # EuroSAT MS might be (B, C, H, W) or (C, H, W)
+                    if img.dim() == 3: img = img.unsqueeze(0)
+                    img = img.to("cuda").float()
                 
+                # Ensure correct channel count for the model
+                # Clay v1.5 expects 10 bands for sentinel-2-l2a
+                expected_channels = 10 if "clay" in args.model_id.lower() else 3
+                if img.shape[1] != expected_channels:
+                    if img.shape[1] < expected_channels:
+                        # Pad with zeros
+                        pad = torch.zeros((img.shape[0], expected_channels - img.shape[1], img.shape[2], img.shape[3]), device="cuda")
+                        img = torch.cat([img, pad], dim=1)
+                    else:
+                        # Slice
+                        img = img[:, :expected_channels, :, :]
+
                 # Forward pass for Clay (datacube) or standard vision
                 with torch.no_grad():
                     if "clay" in args.model_id.lower():
