@@ -102,6 +102,18 @@ sentinel-1-rtc:
         
     model.eval()
 
+    # Auto-detect layers if not manually specified or to verify
+    if hasattr(model, "model") and hasattr(model.model, "blocks"):
+        actual_layers = len(model.model.blocks)
+        if actual_layers != num_layers:
+            print(f"Adjusting num_layers from {num_layers} to {actual_layers} based on model blocks.")
+            num_layers = actual_layers
+    elif hasattr(model, "model") and hasattr(model.model, "layers"):
+        actual_layers = len(model.model.layers)
+        if actual_layers != num_layers:
+            print(f"Adjusting num_layers from {num_layers} to {actual_layers} based on model layers.")
+            num_layers = actual_layers
+
     # 3. Initialize Predictors
     predictors = [LowRankPredictor(d_model, args.rank, d_ffn).cuda() for _ in range(num_layers)]
     optimizers = [optim.Adam(p.parameters(), lr=1e-4) for p in predictors]
@@ -210,17 +222,17 @@ sentinel-1-rtc:
                 else:
                     img = img.unsqueeze(0).to("cuda")
                 
-                # Forward pass with dummy metadata for Clay
+                # Forward pass for Clay (datacube) or standard vision
                 with torch.no_grad():
                     if "clay" in args.model_id.lower():
-                        # Clay v1.5 expects (chips, timestamps, waves)
-                        # EuroSAT RGB center wavelengths in nm
-                        waves = torch.tensor([[490.0, 560.0, 665.0]], device="cuda")
-                        time = torch.tensor([[0, 0, 0.0, 0.0]], device="cuda")
-                        if hasattr(model, "encoder"):
-                            model.encoder(img, time, waves)
-                        else:
-                            model(img, time, waves)
+                        # ClayMAEModule expects a datacube dictionary
+                        datacube = {
+                            "pixels": img,
+                            "time": torch.zeros((img.shape[0], 4), device="cuda"),
+                            "latlon": torch.zeros((img.shape[0], 4), device="cuda"),
+                            "platform": "sentinel-2-l2a"
+                        }
+                        model(datacube)
                     else:
                         model(img)
             else:
