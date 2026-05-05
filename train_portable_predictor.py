@@ -118,15 +118,23 @@ sentinel-1-rtc:
     # Flexible module search for hooks
     for i in range(num_layers):
         layer_mod = None
-        # 1. HuggingFace standard CausalLM (Llama/OPT)
-        if hasattr(model, "model"):
-            sub = model.model
-            if hasattr(sub, "layers"): layer_mod = sub.layers[i].mlp.act_fn # Llama
-            elif hasattr(sub, "decoder") and hasattr(sub.decoder, "layers"): # OPT
-                layer_mod = sub.decoder.layers[i].activation_fn
-        # 2. Vision / Custom (Clay)
-        elif hasattr(model, "blocks"): layer_mod = model.blocks[i].mlp.act
-        elif hasattr(model, "model") and hasattr(model.model, "blocks"): layer_mod = model.model.blocks[i].mlp.act
+        
+        # 1. Check model.model.blocks[i].mlp.act (Clay / Timm / DINOv2)
+        if hasattr(model, "model") and hasattr(model.model, "blocks") and i < len(model.model.blocks):
+            layer_mod = getattr(model.model.blocks[i].mlp, "act", None)
+        
+        # 2. Check model.blocks[i].mlp.act (Direct ViT)
+        if not layer_mod and hasattr(model, "blocks") and i < len(model.blocks):
+            layer_mod = getattr(model.blocks[i].mlp, "act", None)
+
+        # 3. Check model.model.layers[i].mlp.act_fn (Llama / HF standard)
+        if not layer_mod and hasattr(model, "model") and hasattr(model.model, "layers") and i < len(model.model.layers):
+            layer_mod = getattr(model.model.layers[i].mlp, "act_fn", None)
+            
+        # 4. Check model.model.decoder.layers[i].activation_fn (OPT)
+        if not layer_mod and hasattr(model, "model") and hasattr(model.model, "decoder") and \
+           hasattr(model.model.decoder, "layers") and i < len(model.model.decoder.layers):
+            layer_mod = getattr(model.model.decoder.layers[i], "activation_fn", None)
 
         if layer_mod:
             hooks.append(layer_mod.register_forward_hook(get_hook(i)))
@@ -136,7 +144,7 @@ sentinel-1-rtc:
     # 5. Training Loop
     dataset_name = args.dataset_name
     if not dataset_name:
-        dataset_name = "allenai/c4" if args.is_causal else "made-with-clay/Clay-v1-data-sample"
+        dataset_name = "allenai/c4" if args.is_causal else "tanganke/eurosat"
     
     print(f"Loading dataset: {dataset_name}...")
     try:

@@ -56,6 +56,22 @@ sudo mount /dev/nvme0n2 /mnt/trainer-disk
 sudo chown $USER:$USER /mnt/trainer-disk
 ```
 
+### 1.6 Install the driver (This might take a few minutes)
+```bash
+sudo apt update
+sudo apt install -y ubuntu-drivers-common
+sudo ubuntu-drivers autoinstall
+
+# 2. Install CUDA Toolkit 12.1 (Compatible with the latest PyTorch)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-12-1
+
+# 3. Reboot the VM to activate the drivers
+sudo reboot
+```
+
 ### 2. Install Project & Dependencies
 ```bash
 # Ensure Git and Python are installed
@@ -121,7 +137,7 @@ python ~/llminflash/train_portable_predictor.py \
     --ffn_dim 4096 \
     --num_layers 24 \
     --samples 5000 \
-    --dataset_name "made-with-clay/Clay-v1-data-sample"
+    --dataset_name "tanganke/eurosat"
 ```
 *Note: Increasing `--samples` to 10000+ will provide higher accuracy on complex datasets.*
 
