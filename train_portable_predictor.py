@@ -209,8 +209,20 @@ sentinel-1-rtc:
                     img = preprocess(img.convert("RGB")).unsqueeze(0).to("cuda")
                 else:
                     img = img.unsqueeze(0).to("cuda")
-                    
-                with torch.no_grad(): model(img)
+                
+                # Forward pass with dummy metadata for Clay
+                with torch.no_grad():
+                    if "clay" in args.model_id.lower():
+                        # Clay v1.5 expects (chips, timestamps, waves)
+                        # EuroSAT RGB center wavelengths in nm
+                        waves = torch.tensor([[490.0, 560.0, 665.0]], device="cuda")
+                        time = torch.tensor([[0, 0, 0.0, 0.0]], device="cuda")
+                        if hasattr(model, "encoder"):
+                            model.encoder(img, time, waves)
+                        else:
+                            model(img, time, waves)
+                    else:
+                        model(img)
             else:
                 print("\nError: Incompatible model/dataset configuration. Use --is_causal for LLMs.")
                 break
@@ -221,14 +233,22 @@ sentinel-1-rtc:
                 
                 if x is None or y_true is None: continue
                 
+                # Ensure x and y_true are compatible
+                if x.shape[0] != y_true.shape[0]:
+                    # Batch or token mismatch, flatten if needed or skip
+                    continue
+
                 optimizers[l_idx].zero_grad()
                 y_pred = predictors[l_idx](x)
-                loss = nn.BCELoss()(y_pred, y_true.float())
+                
+                # BCELoss requires same shape. ViT tokens might need flattening.
+                loss = nn.BCELoss()(y_pred.view(-1), y_true.view(-1).float())
                 loss.backward()
                 optimizers[l_idx].step()
             pbar.update(1)
         except Exception as e:
-            print(f"Sample {i} failed: {e}")
+            if i % 100 == 0: # Only print every 100th error to avoid flooding
+                print(f"Sample {i} failed: {e}")
             continue
     
     for h in hooks: h.remove()
