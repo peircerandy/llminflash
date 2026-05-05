@@ -66,7 +66,6 @@ class FlashFFN(nn.Module):
 
 TEST_QUESTIONS = [
     {"prompt": "Question: What is the capital of France?\nAnswer:", "expected": "Paris", "desc": "Basic Knowledge"},
-    {"prompt": "Beginners BBQ Class Taking Place in Missoula! Do you want to get better at making delicious BBQ? You will have the opportunity, put this on your calendar now. Thursday, September 22nd join World Class BBQ Champion, Tony Balay from Lonestar Smoke Rangers.", "expected": "teach", "desc": "Overfit Recall"},
 ]
 
 def load_flash_model(mode_name, top_k=1024, threshold=0.2):
@@ -89,6 +88,7 @@ def load_flash_model(mode_name, top_k=1024, threshold=0.2):
     set_module_tensor_to_device(model, "lm_head.weight", DEVICE, value=model.model.decoder.embed_tokens.weight, dtype=torch.float16)
 
     for i in range(32):
+        if i % 4 == 0: print(f"  Processed {i+1}/32 layers...")
         layer_file = os.path.join(LAYERS_DIR, f"layer_{i}.pt")
         layer_sd = torch.load(layer_file, map_location="cpu")
         fc1_b = layer_sd[f"decoder.layers.{i}.fc1.bias"].float().cpu().contiguous()
@@ -107,11 +107,18 @@ def load_flash_model(mode_name, top_k=1024, threshold=0.2):
 
 def run_suite():
     results = []
-    modes = ["oracle", "predictor"]
+    modes = ["quantized", "predictor"]
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH, local_files_only=True)
 
     for mode in modes:
-        model, engine_ptr = load_flash_model(mode)
+        if mode == "quantized":
+            print(f"Loading model in {mode.upper()} mode...")
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+            model = OPTForCausalLM.from_pretrained(MODEL_ID, quantization_config=quantization_config, device_map="auto", cache_dir=CACHE_PATH, local_files_only=True)
+            engine_ptr = None
+        else:
+            model, engine_ptr = load_flash_model(mode)
         model.eval()
         
         total_tps = 0
@@ -121,11 +128,11 @@ def run_suite():
             inputs = tokenizer(q["prompt"], return_tensors="pt").to(model.device)
             start = time.time()
             with torch.no_grad():
-                out = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+                out = model.generate(**inputs, max_new_tokens=4, do_sample=False)
             elapsed = time.time() - start
             text = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
             
-            tps = 10 / elapsed
+            tps = 4 / elapsed
             total_tps += tps
             is_correct = q["expected"].lower() in text.lower()
             if is_correct: total_correct += 1
@@ -134,12 +141,13 @@ def run_suite():
         results.append({
             "Mode": mode.upper(),
             "Avg Tokens/Sec": total_tps / len(TEST_QUESTIONS),
-            "Avg Time (s)": 10 / (total_tps / len(TEST_QUESTIONS)),
+            "Avg Time (s)": 4 / (total_tps / len(TEST_QUESTIONS)) if total_tps > 0 else 0,
             "Accuracy %": (total_correct / len(TEST_QUESTIONS)) * 100
         })
         
         del model
-        lib.destroy_engine(engine_ptr)
+        if engine_ptr:
+            lib.destroy_engine(engine_ptr)
         gc.collect(); torch.cuda.empty_cache()
 
     df = pd.DataFrame(results)

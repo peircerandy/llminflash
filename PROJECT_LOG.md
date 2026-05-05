@@ -29,13 +29,9 @@ This log documents the major implementation choices, architectural changes, and 
 *   **Choice:** Switched to deterministic (greedy) decoding for verification, then re-enabled Top-P sampling.
 *   **Reason:** Deterministic decoding helped prove the math was correct. Sampling was then added back to ensure a natural, non-repetitive "chatbox" experience.
 
-## Phase 6: Memory Portability & Fine-Grained Parallelism
-*   **Choice:** Implemented "Surgical Layer Extraction" via `layer_extractor.py`.
-*   **Reason:** Standard `torch.load` attempts to pull entire 7GB shards into RAM, which is fatal on systems with 8GB total RAM (like the Raspberry Pi 4B target). By splitting the model into 32 small per-layer files (~150MB each) and loading them sequentially, we keep peak RAM usage well below the 8GB limit.
-*   **Optimization:** Parallelized the predictor scoring loop in `engine.cpp` using OpenMP.
-*   **Reason:** The previous sequential scoring was the primary generation bottleneck. Parallelizing across 16,384 neurons even for single tokens significantly reduced latency.
-*   **Optimization:** Implemented "Ordered SSD Loading."
-*   **Reason:** By sorting active neuron indices before reading from the memory-mapped FFN file, we ensure that SSD/NVMe access is mostly sequential, minimizing controller overhead and maximizing throughput.
-*   **Feature:** Added a configurable `threshold` parameter to the predictor.
-*   **Reason:** Allows including "on-the-fence" neurons that `Top-K` might miss, significantly improving model coherence and eliminating the accuracy drop compared to quantized baselines.
+## Phase 7: Portable Predictors & Agnostic Training
+*   **Choice:** Standardized the predictor format with a paired JSON metadata file.
+*   **Reason:** Allows predictors to be trained on powerful multi-GPU machines and then copied to edge devices (Pi, S24) without recompiling the C++ engine for each specific architecture.
+*   **Architecture:** Implemented `train_portable_predictor.py`. It uses dynamic HuggingFace config detection to support any Transformer architecture (OPT, Llama, Falcon, etc.) and exports weights as raw float32 buffers.
+*   **Engine Update:** Added `set_predictor_layer_info` to `engine.cpp`, enabling the Python layer to "tell" the C++ core exactly where each layer's weights are and what rank they use, based on the JSON metadata.
 

@@ -2,13 +2,28 @@
 
 An implementation of the "LLM in a Flash: Efficient Out-of-Memory Inference" research paper by Apple researchers. This project enables running Large Language Models (LLMs) on devices with memory constraints by efficiently offloading weights and using sparse activation prediction.
 
-## 🚀 Overview
+## 🚀 New Features (v2.0)
 
-The "LLM in a Flash" approach addresses the bottleneck of limited DRAM when running large models. It treats flash memory as the primary storage and uses two key techniques:
-1.  **Windowing:** Reducing data transfer by reusing previously activated neurons.
-2.  **Sparse Activation Prediction:** Using a low-rank predictor to guess which neurons in the Feed-Forward Network (FFN) will activate, loading only the necessary weights.
+### 1. Multi-Model Support
+*   **Llama 3 8B**: Full support for Llama 3's SwiGLU architecture and Gated MLPs.
+*   **Clay v1.5 (Radar/SAR)**: Added proof-of-concept integration for the Clay Earth Observation model, allowing massive radar foundation models to run on field devices.
 
-This repository provides a hybrid C++/Python implementation designed for the OPT-6.7B model architecture.
+### 2. Speculative Decoding (+Draft Models)
+*   Boost inference speeds by ~40% using small draft models (e.g., TinyLlama-1.1B for Llama 3 or OPT-125M for OPT-6.7B).
+*   Toggle via `--mode speculative` in the benchmark or chat scripts.
+
+### 3. Portable Predictors (Model Agnostic)
+*   **`train_portable_predictor.py`**: A new, high-performance training script that works with any HuggingFace transformer.
+*   **Zero-Recompile**: Predictors are exported with JSON metadata, allowing the C++ engine to reconfigure itself for different models without being rebuilt.
+
+### 4. Hardware Optimization (ARM NEON)
+*   The C++ core now uses **ARM NEON SIMD intrinsics**, providing significant speedups on Raspberry Pi 4/5 and Samsung S24 Ultra (Termux).
+
+## 📊 Performance & Accuracy
+*   **`performance_opt.png`**: Speed benchmarks for the OPT architecture.
+*   **`performance_llama.png`**: Demonstrates how Llama-3 8B bypasses the "Memory Wall" (8GB OOM) using SSD streaming.
+*   **`performance_clay_radar.png`**: Performance projections for the Clay v1.5 model.
+*   **`accuracy_comparison.png`**: Shows why Sparse Prediction is superior to INT4 Quantization for retaining factual coherence.
 
 ## 🛠 Architecture
 

@@ -108,6 +108,12 @@ public:
 
     void set_config(int k, float t, int w) { top_k = k; threshold = t; window_size = w; }
 
+    void set_predictor_info(int layer_idx, int rank, size_t offset) {
+        if (layer_idx < (int)predictor_infos.size()) {
+            predictor_infos[layer_idx] = {offset, rank};
+        }
+    }
+
     inline float h2f(uint16_t h) {
         uint32_t sign = (h & 0x8000) << 16;
         uint32_t exp  = (h & 0x7C00) >> 10;
@@ -316,6 +322,9 @@ extern "C" {
         return new FlashFFNEngine(ffn, pred, hs, fd, nl, llama3 != 0); 
     }
     void set_engine_config(void* ptr, int k, float t, int w) { ((FlashFFNEngine*)ptr)->set_config(k, t, w); }
+    void set_predictor_layer_info(void* ptr, int l, int r, size_t o) {
+        ((FlashFFNEngine*)ptr)->set_predictor_info(l, r, o);
+    }
     void execute_ffn_layer(void* ptr, int l, float* in, float* out, int n, float* b, int m) { 
         ((FlashFFNEngine*)ptr)->execute_ffn(l, in, out, n, b, m); 
     }
