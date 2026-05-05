@@ -30,7 +30,7 @@ gcloud compute instances create predictor-trainer \
     --boot-disk-size=200GB \
     --maintenance-policy=TERMINATE
 
-# Create and attach the second disk for weights (name it descriptively, e.g., trainer-disk)
+# Create and attach the second disk for weights
 gcloud compute disks create trainer-disk \
     --zone=us-central1-a \
     --size=500GB \
@@ -40,7 +40,6 @@ gcloud compute instances attach-disk predictor-trainer \
     --zone=us-central1-a \
     --disk=trainer-disk
 ```
-*Note: If using the UI, select "Balanced persistent disk" or "SSD persistent disk" for the second disk, size 500GB, and name it "trainer-disk". "Storage pool" is not applicable in GCP—use disk types instead.*
 
 ### 1.5. Mount the Second Disk
 After attaching the disk, format and mount it for storing model weights and outputs:
@@ -57,7 +56,7 @@ sudo mount /dev/nvme0n2 /mnt/trainer-disk
 sudo chown $USER:$USER /mnt/trainer-disk
 ```
 
-### 2. Install Project
+### 2. Install Project & Dependencies
 ```bash
 # Ensure Git and Python are installed
 sudo apt update && sudo apt install -y git python3 python3-pip
@@ -79,13 +78,17 @@ git checkout device-optimizations
 pip install -r requirements.txt
 ```
 
-### 2.5. Authenticate & Configure Cache (CRUCIAL)
-Models like **Llama 3** are gated and require authentication. We also want to ensure the massive downloads go to our 500GB disk, not the boot disk.
+### 2.5. Authenticate & Install Custom Model Packages (CRUCIAL)
+Models like **Llama 3** are gated and require authentication. Models like **Clay v1.5** require their specific foundation library to be recognized by Transformers.
+
 ```bash
 # 1. Login to Hugging Face (Paste your "Read" token when prompted)
 huggingface-cli login
 
-# 2. Point the model cache to the mounted large disk
+# 2. INSTALL CLAY SPECIFIC LIBRARY (Required for geovit+DOFA architecture)
+pip install git+https://github.com/Clay-foundation/model.git
+
+# 3. Point the model cache to the mounted large disk
 mkdir -p /mnt/trainer-disk/hf_cache
 export HF_HOME=/mnt/trainer-disk/hf_cache
 ```
@@ -97,13 +100,14 @@ cd /mnt/trainer-disk
 conda activate llm-flash
 export HF_HOME=/mnt/trainer-disk/hf_cache
 
-# For Llama 3 8B
+# For Llama 3 8B (Note the --is_causal flag for LLMs)
 python ~/llminflash/train_portable_predictor.py \
     --model_id meta-llama/Meta-Llama-3-8B \
     --samples 5000 \
-    --rank 128
+    --rank 128 \
+    --is_causal
 
-# For Clay v1.5 (Radar/SAR Foundation Model)
+# For Clay v1.5 (Vision Transformer)
 python ~/llminflash/train_portable_predictor.py \
     --model_id made-with-clay/Clay \
     --samples 5000 \
@@ -112,11 +116,8 @@ python ~/llminflash/train_portable_predictor.py \
 *Note: Increasing `--samples` to 10000+ will provide higher accuracy on complex datasets.*
 
 ### 4. Export to Edge
-Once training is complete, your `.bin` and `.json` files will be in `/mnt/trainer-disk/`. Use `gcloud scp` to download them to your local computer or edge device:
+Once training is complete, your `.bin` and `.json` files will be in `/mnt/trainer-disk/`. Use `gcloud scp` to download them:
 ```bash
-# Example for Llama 3
-gcloud compute scp predictor-trainer:/mnt/trainer-disk/Meta-Llama-3-8B_predictors.* .
-
 # Example for Clay Radar Model
 gcloud compute scp predictor-trainer:/mnt/trainer-disk/Clay_predictors.* .
 ```
@@ -124,6 +125,6 @@ gcloud compute scp predictor-trainer:/mnt/trainer-disk/Clay_predictors.* .
 ---
 
 ## 📡 Special Note: Radar Model (Clay v1.5)
-Since Clay v1.5 is a Vision Transformer (ViT), the **`train_portable_predictor.py`** script will automatically handle its 96 MLP blocks. 
+Clay v1.5 uses a custom **`geovit+DOFA`** architecture. By installing the `claymodel` package and using **`trust_remote_code=True`** (built into the updated trainer script), the system will automatically handle the 96 MLP blocks. 
 
-**Recommendation:** For Radar data, train on the **C4 dataset** (default) if you want general language-like feature extraction, or point the trainer to a **SAR image dataset** (e.g., Sentinel-1) on HuggingFace for specialized radar accuracy.
+**Recommendation:** For Radar data, train on the **C4 dataset** (default) if you want general language-like feature extraction, or point the trainer to a **SAR image dataset** on HuggingFace for specialized radar accuracy.
