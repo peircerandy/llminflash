@@ -55,25 +55,21 @@ sudo mkfs.ext4 /dev/nvme0n2
 sudo mkdir -p /mnt/trainer-disk
 sudo mount /dev/nvme0n2 /mnt/trainer-disk
 sudo chown $USER:$USER /mnt/trainer-disk
-
-# Change to the data directory for training
-cd /mnt/trainer-disk
-# Note: The directory will be empty initially; trained files will appear here after running the trainer.
 ```
 
 ### 2. Install Project
 ```bash
-# Ensure Git and Python are installed (may not be pre-installed on some images)
+# Ensure Git and Python are installed
 sudo apt update && sudo apt install -y git python3 python3-pip
 
-# Install Miniconda for environment management (if not already installed)
+# Install Miniconda
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
 bash miniconda.sh -b -p $HOME/miniconda
 export PATH="$HOME/miniconda/bin:$PATH"
 conda init bash
-source ~/.bashrc  # Reload shell to apply conda init changes
+source ~/.bashrc 
 
-# Create and activate a conda environment for the project
+# Create and activate environment
 conda create -n llm-flash python=3.10 -y
 conda activate llm-flash
 
@@ -82,43 +78,52 @@ cd llminflash
 git checkout device-optimizations
 pip install -r requirements.txt
 ```
-*Note: Using a conda environment isolates dependencies and matches the project's testing setup. If conda is already installed, skip the Miniconda installation steps.*
+
+### 2.5. Authenticate & Configure Cache (CRUCIAL)
+Models like **Llama 3** are gated and require authentication. We also want to ensure the massive downloads go to our 500GB disk, not the boot disk.
+```bash
+# 1. Login to Hugging Face (Paste your "Read" token when prompted)
+huggingface-cli login
+
+# 2. Point the model cache to the mounted large disk
+mkdir -p /mnt/trainer-disk/hf_cache
+export HF_HOME=/mnt/trainer-disk/hf_cache
+```
 
 ### 3. Run Agnostic Trainer
-Train the predictor for any model (e.g., Clay v1.5, OPT-6.7B, or Llama 3 8B). The script auto-detects architecture. Ensure the conda environment is activated and you're in the data directory:
+Train the predictor for any model. The script auto-detects architecture. Ensure you are in the `/mnt/trainer-disk` folder so the resulting `.bin` and `.json` files are saved there.
 ```bash
 cd /mnt/trainer-disk
 conda activate llm-flash
-
-# For Clay v1.5 (Vision Transformer)
-python ~/llminflash/train_portable_predictor.py \
-    --model_id made-with-clay/Clay \
-    --samples 5000 \
-    --rank 128
-
-# For OPT-6.7B
-python ~/llminflash/train_portable_predictor.py \
-    --model_id facebook/opt-6.7b \
-    --samples 5000 \
-    --rank 128
+export HF_HOME=/mnt/trainer-disk/hf_cache
 
 # For Llama 3 8B
 python ~/llminflash/train_portable_predictor.py \
     --model_id meta-llama/Meta-Llama-3-8B \
     --samples 5000 \
     --rank 128
+
+# For Clay v1.5 (Radar/SAR Foundation Model)
+python ~/llminflash/train_portable_predictor.py \
+    --model_id made-with-clay/Clay \
+    --samples 5000 \
+    --rank 128
 ```
-*Note: Increasing `--samples` to 5000-10000 will provide higher accuracy on complex datasets like Radar/SAR. For Clay, use C4 dataset (default) or a SAR dataset from HuggingFace. The predictor files (.bin and .json) will be saved in /mnt/trainer-disk.*
+*Note: Increasing `--samples` to 10000+ will provide higher accuracy on complex datasets.*
 
 ### 4. Export to Edge
-Once training is complete, download the `.bin` and `.json` files from the data disk to your local machine (replace `MODEL_NAME` with your model's identifier):
+Once training is complete, your `.bin` and `.json` files will be in `/mnt/trainer-disk/`. Use `gcloud scp` to download them to your local computer or edge device:
 ```bash
-gcloud compute scp predictor-trainer:/mnt/trainer-disk/MODEL_NAME_predictors.* .
+# Example for Llama 3
+gcloud compute scp predictor-trainer:/mnt/trainer-disk/Meta-Llama-3-8B_predictors.* .
+
+# Example for Clay Radar Model
+gcloud compute scp predictor-trainer:/mnt/trainer-disk/Clay_predictors.* .
 ```
 
 ---
 
 ## 📡 Special Note: Radar Model (Clay v1.5)
-Since Clay v1.5 is a Vision Transformer (ViT), ensure you use the **`train_portable_predictor.py`** script. Because it auto-detects architecture, it will handle the 96 MLP blocks in Clay without modification. 
+Since Clay v1.5 is a Vision Transformer (ViT), the **`train_portable_predictor.py`** script will automatically handle its 96 MLP blocks. 
 
-**Recommendation:** For Radar data, train on the **C4 dataset** (default) if you want general language-like feature extraction, or point the trainer to a **SAR image dataset** from HuggingFace for domain-specific accuracy. The 500GB second disk provides ample space for Clay checkpoints, datasets, and predictor outputs alongside other models.
+**Recommendation:** For Radar data, train on the **C4 dataset** (default) if you want general language-like feature extraction, or point the trainer to a **SAR image dataset** (e.g., Sentinel-1) on HuggingFace for specialized radar accuracy.
