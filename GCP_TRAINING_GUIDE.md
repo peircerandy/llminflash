@@ -68,8 +68,8 @@ export PATH="$HOME/miniconda/bin:$PATH"
 conda init bash
 source ~/.bashrc 
 
-# Create and activate environment
-conda create -n llm-flash python=3.10 -y
+# Create and activate environment (Python 3.11+ required for Clay)
+conda create -n llm-flash python=3.11 -y
 conda activate llm-flash
 
 git clone https://github.com/peircerandy/llminflash.git
