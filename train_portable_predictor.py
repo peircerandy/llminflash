@@ -59,7 +59,7 @@ def train(args):
         else:
             # For Clay/ViT models
             try:
-                model = AutoModel.from_pretrained(args.model_id, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
+                model = AutoModel.from_pretrained(args.model_id, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True, dtype="auto")
             except ValueError as ve:
                 if "geovit+DOFA" in str(ve) and "clay" in args.model_id.lower():
                     print("Registering custom 'geovit+DOFA' via claymodel library...")
@@ -110,25 +110,62 @@ def train(args):
             print(f"Warning: Activation layer {i} not found. Capture will fail.")
 
     # 5. Training Loop
-    dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
+    dataset_name = args.dataset_name
+    if not dataset_name:
+        dataset_name = "allenai/c4" if args.is_causal else "made-with-clay/Clay-v1-data-sample"
+    
+    print(f"Loading dataset: {dataset_name}...")
+    try:
+        dataset = load_dataset(dataset_name, "en" if "c4" in dataset_name else None, split="train", streaming=True)
+    except Exception as e:
+        print(f"Error: Could not load dataset {dataset_name}: {e}")
+        return
+
     pbar = tqdm(total=args.samples, desc="Training")
     
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-    except:
-        tokenizer = None
+    tokenizer = None
+    if args.is_causal:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+        except:
+            print("Warning: No tokenizer found for causal model.")
+
+    from torchvision import transforms
+    preprocess = transforms.Compose([
+        transforms.Resize(224),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
     for i, sample in enumerate(dataset):
         if i >= args.samples: break
         
         try:
-            if tokenizer:
+            if args.is_causal and tokenizer:
                 inputs = tokenizer(sample['text'], return_tensors="pt", truncation=True, max_length=128).to("cuda")
                 with torch.no_grad(): outputs = model(**inputs, output_hidden_states=True)
+            elif not args.is_causal:
+                # Vision/Custom data handling
+                img = None
+                if 'image' in sample: img = sample['image']
+                elif 'img' in sample: img = sample['img']
+                elif 'pixels' in sample: img = sample['pixels']
+                
+                if img is None:
+                    print(f"\nWarning: Sample {i} has no recognizable image field. Skipping.")
+                    continue
+                
+                # If it's already a tensor (from some datasets), just use it, else preprocess
+                if not isinstance(img, torch.Tensor):
+                    img = preprocess(img.convert("RGB")).unsqueeze(0).to("cuda")
+                else:
+                    img = img.unsqueeze(0).to("cuda")
+                    
+                with torch.no_grad(): outputs = model(img, output_hidden_states=True)
             else:
-                # Dummy vision input if no tokenizer
-                dummy_x = torch.randn(1, 3, 224, 224).cuda()
-                with torch.no_grad(): outputs = model(dummy_x, output_hidden_states=True)
+                print("\nError: Incompatible model/dataset configuration. Use --is_causal for LLMs.")
+                break
                 
             for l_idx in range(num_layers):
                 h_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else []
@@ -178,4 +215,5 @@ if __name__ == "__main__":
     parser.add_argument("--samples", type=int, default=1000)
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--is_causal", action="store_true", help="Set for LLMs")
+    parser.add_argument("--dataset_name", type=str, help="HF Dataset name (e.g., 'allenai/c4' or 'food101')")
     train(parser.parse_args())

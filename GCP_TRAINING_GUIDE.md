@@ -78,17 +78,23 @@ git checkout device-optimizations
 pip install -r requirements.txt
 ```
 
-### 2.5. Authenticate & Install Custom Model Packages (CRUCIAL)
-Models like **Llama 3** are gated and require authentication. Models like **Clay v1.5** require their specific foundation library to be recognized by Transformers.
+### 2.5. Authenticate & Download Models (CRUCIAL)
+Models like **Llama 3** are gated and require authentication. Models like **Clay v1.5** require downloading a specific checkpoint file.
 
 ```bash
 # 1. Login to Hugging Face (Paste your "Read" token when prompted)
-huggingface-cli login
+hf login
 
-# 2. INSTALL CLAY SPECIFIC LIBRARY (Required for geovit+DOFA architecture)
+# 2. Download Clay v1.5 Checkpoint
+# Note: Using 'hf' (standard alias for huggingface-cli)
+hf download made-with-clay/Clay v1.5/clay-v1.5.ckpt --local-dir /mnt/trainer-disk/clay-tmp
+mv /mnt/trainer-disk/clay-tmp/v1.5/clay-v1.5.ckpt /mnt/trainer-disk/clay-v1.5.ckpt
+rm -rf /mnt/trainer-disk/clay-tmp
+
+# 3. INSTALL CLAY SPECIFIC LIBRARY (Required for geovit+DOFA architecture)
 pip install git+https://github.com/Clay-foundation/model.git
 
-# 3. Point the model cache to the mounted large disk
+# 4. Point the model cache to the mounted large disk
 mkdir -p /mnt/trainer-disk/hf_cache
 export HF_HOME=/mnt/trainer-disk/hf_cache
 ```
@@ -110,8 +116,11 @@ python ~/llminflash/train_portable_predictor.py \
 # For Clay v1.5 (Vision Transformer)
 python ~/llminflash/train_portable_predictor.py \
     --model_id made-with-clay/Clay \
-    --samples 5000 \
-    --rank 128
+    --ckpt_path /mnt/trainer-disk/clay-v1.5.ckpt \
+    --hidden_size 1024 \
+    --ffn_dim 4096 \
+    --num_layers 24 \
+   --samples 5000
 ```
 *Note: Increasing `--samples` to 10000+ will provide higher accuracy on complex datasets.*
 
