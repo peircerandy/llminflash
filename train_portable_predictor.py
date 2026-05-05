@@ -139,22 +139,38 @@ sentinel-1-rtc:
         mlp_mod = None
         act_mod = None
         
-        # 1. Check Clay / Timm / DINOv2
-        if hasattr(model, "model") and hasattr(model.model, "blocks") and i < len(model.model.blocks):
+        # 1. Check Clay / Transformer.layers[i][1] (FeedForward)
+        if hasattr(model, "model") and hasattr(model.model, "encoder") and \
+           hasattr(model.model.encoder, "transformer") and hasattr(model.model.encoder.transformer, "layers"):
+            layers = model.model.encoder.transformer.layers
+            if i < len(layers):
+                # Clay layers are [Attention, FeedForward]
+                mlp_mod = layers[i][1]
+                # FeedForward usually has an 'fn' or 'net' or just an act
+                # Looking at standard ViT/Clay FeedForward: it has 'net' nn.Sequential
+                if hasattr(mlp_mod, "net"):
+                    # Find GELU in the sequence
+                    for sub in mlp_mod.net:
+                        if isinstance(sub, (nn.GELU, nn.ReLU, nn.SiLU)):
+                            act_mod = sub
+                            break
+        
+        # 2. Check Standard ViT / Timm
+        if not mlp_mod and hasattr(model, "model") and hasattr(model.model, "blocks") and i < len(model.model.blocks):
             mlp_mod = model.model.blocks[i].mlp
             act_mod = getattr(mlp_mod, "act", None)
         
-        # 2. Check Direct ViT
+        # 3. Check Direct ViT
         if not mlp_mod and hasattr(model, "blocks") and i < len(model.blocks):
             mlp_mod = model.blocks[i].mlp
             act_mod = getattr(mlp_mod, "act", None)
 
-        # 3. Check Llama / HF standard
+        # 4. Check Llama / HF standard
         if not mlp_mod and hasattr(model, "model") and hasattr(model.model, "layers") and i < len(model.model.layers):
             mlp_mod = model.model.layers[i].mlp
             act_mod = getattr(mlp_mod, "act_fn", None)
             
-        # 4. Check OPT
+        # 5. Check OPT
         if not mlp_mod and hasattr(model, "model") and hasattr(model.model, "decoder") and \
            hasattr(model.model.decoder, "layers") and i < len(model.model.decoder.layers):
             mlp_mod = model.model.decoder.layers[i]
@@ -225,12 +241,13 @@ sentinel-1-rtc:
                 # Forward pass for Clay (datacube) or standard vision
                 with torch.no_grad():
                     if "clay" in args.model_id.lower():
-                        # ClayMAEModule expects a datacube dictionary
+                        # ClayMAEModule expects a datacube dictionary. 
+                        # Platform MUST be a list to avoid string indexing error platform[0] -> 's'
                         datacube = {
                             "pixels": img,
                             "time": torch.zeros((img.shape[0], 4), device="cuda"),
                             "latlon": torch.zeros((img.shape[0], 4), device="cuda"),
-                            "platform": "sentinel-2-l2a"
+                            "platform": ["sentinel-2-l2a"] * img.shape[0]
                         }
                         model(datacube)
                     else:
