@@ -234,21 +234,30 @@ sentinel-1-rtc:
                     print(f"\nWarning: Sample {i} has no recognizable image field. Skipping.")
                     continue
 
-                # Handle different data types (PIL, List, Tensor)
+                # 1. Convert to Tensor [C, H, W]
                 if isinstance(img, list):
                     img = torch.tensor(img).float()
                 
                 if not isinstance(img, torch.Tensor):
+                    # PIL Image
                     if hasattr(img, "convert"):
-                        img = preprocess(img.convert("RGB")).unsqueeze(0).to("cuda")
+                        img = preprocess(img.convert("RGB"))
                     else:
-                        img = torch.tensor(img).float().unsqueeze(0).to("cuda")
-                else:
-                    # EuroSAT MS might be (B, C, H, W) or (C, H, W)
-                    if img.dim() == 3: img = img.unsqueeze(0)
-                    img = img.to("cuda").float()
+                        img = transforms.ToTensor()(img)
                 
-                # Ensure correct channel count for the model
+                # Now we have a tensor [C, H, W]
+                if img.dim() == 2: # H, W
+                    img = img.unsqueeze(0)
+                
+                # 2. Consistently Resize to 224x224 (Standard ViT/Clay size)
+                # This ensures the patch count (224/8 = 28) matches internal model expectations
+                if img.shape[-1] != 224 or img.shape[-2] != 224:
+                    img = transforms.Resize((224, 224))(img)
+
+                # 3. Ensure Batch Dim
+                img = img.unsqueeze(0).to("cuda").float()
+                
+                # 4. Ensure correct channel count for the model
                 # Clay v1.5 expects 10 bands for sentinel-2-l2a
                 expected_channels = 10 if "clay" in args.model_id.lower() else 3
                 if img.shape[1] != expected_channels:
