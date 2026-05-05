@@ -120,7 +120,8 @@ python ~/llminflash/train_portable_predictor.py \
     --hidden_size 1024 \
     --ffn_dim 4096 \
     --num_layers 24 \
-   --samples 5000
+    --samples 5000 \
+    --dataset_name "made-with-clay/Clay-v1-data-sample"
 ```
 *Note: Increasing `--samples` to 10000+ will provide higher accuracy on complex datasets.*
 
