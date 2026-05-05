@@ -106,40 +106,53 @@ sentinel-1-rtc:
     predictors = [LowRankPredictor(d_model, args.rank, d_ffn).cuda() for _ in range(num_layers)]
     optimizers = [optim.Adam(p.parameters(), lr=1e-4) for p in predictors]
     
-    # 4. Activation Capture Logic
-    activations = {}
-    def get_hook(idx):
+    # 4. Capture Logic
+    captured_inputs = {}
+    captured_acts = {}
+    
+    def get_input_hook(idx):
+        def hook(m, i, o):
+            captured_inputs[idx] = i[0].detach().float()
+        return hook
+        
+    def get_act_hook(idx):
         def hook(m, i, o):
             act_data = o[0] if isinstance(o, tuple) else o
-            activations[idx] = (act_data > 0).float().detach()
+            captured_acts[idx] = (act_data > 0).float().detach()
         return hook
 
     hooks = []
     # Flexible module search for hooks
     for i in range(num_layers):
-        layer_mod = None
+        mlp_mod = None
+        act_mod = None
         
-        # 1. Check model.model.blocks[i].mlp.act (Clay / Timm / DINOv2)
+        # 1. Check Clay / Timm / DINOv2
         if hasattr(model, "model") and hasattr(model.model, "blocks") and i < len(model.model.blocks):
-            layer_mod = getattr(model.model.blocks[i].mlp, "act", None)
+            mlp_mod = model.model.blocks[i].mlp
+            act_mod = getattr(mlp_mod, "act", None)
         
-        # 2. Check model.blocks[i].mlp.act (Direct ViT)
-        if not layer_mod and hasattr(model, "blocks") and i < len(model.blocks):
-            layer_mod = getattr(model.blocks[i].mlp, "act", None)
+        # 2. Check Direct ViT
+        if not mlp_mod and hasattr(model, "blocks") and i < len(model.blocks):
+            mlp_mod = model.blocks[i].mlp
+            act_mod = getattr(mlp_mod, "act", None)
 
-        # 3. Check model.model.layers[i].mlp.act_fn (Llama / HF standard)
-        if not layer_mod and hasattr(model, "model") and hasattr(model.model, "layers") and i < len(model.model.layers):
-            layer_mod = getattr(model.model.layers[i].mlp, "act_fn", None)
+        # 3. Check Llama / HF standard
+        if not mlp_mod and hasattr(model, "model") and hasattr(model.model, "layers") and i < len(model.model.layers):
+            mlp_mod = model.model.layers[i].mlp
+            act_mod = getattr(mlp_mod, "act_fn", None)
             
-        # 4. Check model.model.decoder.layers[i].activation_fn (OPT)
-        if not layer_mod and hasattr(model, "model") and hasattr(model.model, "decoder") and \
+        # 4. Check OPT
+        if not mlp_mod and hasattr(model, "model") and hasattr(model.model, "decoder") and \
            hasattr(model.model.decoder, "layers") and i < len(model.model.decoder.layers):
-            layer_mod = getattr(model.model.decoder.layers[i], "activation_fn", None)
+            mlp_mod = model.model.decoder.layers[i]
+            act_mod = getattr(mlp_mod, "activation_fn", None)
 
-        if layer_mod:
-            hooks.append(layer_mod.register_forward_hook(get_hook(i)))
+        if mlp_mod and act_mod:
+            hooks.append(mlp_mod.register_forward_hook(get_input_hook(i)))
+            hooks.append(act_mod.register_forward_hook(get_act_hook(i)))
         else:
-            print(f"Warning: Activation layer {i} not found. Capture will fail.")
+            print(f"Warning: MLP or Activation layer {i} not found. Capture will fail.")
 
     # 5. Training Loop
     dataset_name = args.dataset_name
@@ -174,9 +187,12 @@ sentinel-1-rtc:
         if i >= args.samples: break
         
         try:
+            captured_inputs.clear()
+            captured_acts.clear()
+            
             if args.is_causal and tokenizer:
                 inputs = tokenizer(sample['text'], return_tensors="pt", truncation=True, max_length=128).to("cuda")
-                with torch.no_grad(): outputs = model(**inputs, output_hidden_states=True)
+                with torch.no_grad(): model(**inputs)
             elif not args.is_causal:
                 # Vision/Custom data handling
                 img = None
@@ -194,18 +210,16 @@ sentinel-1-rtc:
                 else:
                     img = img.unsqueeze(0).to("cuda")
                     
-                with torch.no_grad(): outputs = model(img, output_hidden_states=True)
+                with torch.no_grad(): model(img)
             else:
                 print("\nError: Incompatible model/dataset configuration. Use --is_causal for LLMs.")
                 break
                 
             for l_idx in range(num_layers):
-                h_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else []
-                if not h_states: break
+                x = captured_inputs.get(l_idx)
+                y_true = captured_acts.get(l_idx)
                 
-                x = h_states[l_idx].detach().float()
-                y_true = activations.get(l_idx)
-                if y_true is None: continue
+                if x is None or y_true is None: continue
                 
                 optimizers[l_idx].zero_grad()
                 y_pred = predictors[l_idx](x)
