@@ -62,17 +62,20 @@ Train the low-rank neural networks that predict neuron activation:
 python train_predictor.py
 ```
 
-### 3. Bundling Weights
-Bundle the OPT-6.7B FFN weights for use with the flash engine:
+### 3. Bundling & Extraction
+Bundle the OPT-6.7B FFN weights and extract the resident layers (Attention/Norms) for memory efficiency:
 ```bash
 python bundle_ffn.py
+python layer_extractor.py
 ```
 
 ### 4. Running Inference
 Run the model in an interactive session:
 ```bash
-python chat.py
+python chat.py --mode predictor
 ```
+*Note: Use `--top_k` and `--threshold` to tune performance vs accuracy.*
+
 
 ## 📊 Performance & Accuracy
 - Performance metrics can be generated using `speed_test.py`.

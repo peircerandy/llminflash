@@ -42,3 +42,6 @@ speed_test copy.py
 *.png
 # Ignore heavy model data/cache if stored locally
 /mnt/wsl/
+
+.gemini/
+gha-creds-*.json
