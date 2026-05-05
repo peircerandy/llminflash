@@ -137,9 +137,9 @@ python ~/llminflash/train_portable_predictor.py \
     --ffn_dim 4096 \
     --num_layers 24 \
     --samples 5000 \
-    --dataset_name "nielsr/eurosat-ms"
+    --dataset_name "blanchon/EuroSAT_MSI"
 ```
-*Note: Using 'nielsr/eurosat-ms' provides 13 spectral bands. The script will automatically slice these to the 10 bands expected by the Clay Sentinel-2 configuration.*
+*Note: Using 'blanchon/EuroSAT_MSI' provides 13 spectral bands. The script will automatically slice these to the 10 bands expected by the Clay Sentinel-2 configuration.*
 *Note: Increasing `--samples` to 10000+ will provide higher accuracy on complex datasets.*
 
 ### 4. Export to Edge

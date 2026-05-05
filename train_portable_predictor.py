@@ -185,7 +185,7 @@ sentinel-1-rtc:
     # 5. Training Loop
     dataset_name = args.dataset_name
     if not dataset_name:
-        dataset_name = "allenai/c4" if args.is_causal else "tanganke/eurosat"
+        dataset_name = "allenai/c4" if args.is_causal else "blanchon/EuroSAT_MSI"
     
     print(f"Loading dataset: {dataset_name}...")
     try:
@@ -224,9 +224,11 @@ sentinel-1-rtc:
             elif not args.is_causal:
                 # Vision/Custom data handling
                 img = None
-                if 'image' in sample: img = sample['image']
-                elif 'img' in sample: img = sample['img']
-                elif 'pixels' in sample: img = sample['pixels']
+                # Flexible field search
+                for key in ['image', 'img', 'pixels', 'pixel_values', 'MSI']:
+                    if key in sample:
+                        img = sample[key]
+                        break
                 
                 if img is None:
                     print(f"\nWarning: Sample {i} has no recognizable image field. Skipping.")
