@@ -4,8 +4,8 @@ train_portable_predictor.py: Standalone, High-Performance Predictor Trainer.
 This script captures activation sparsity from ANY transformer model (HuggingFace) 
 and trains low-rank predictors. Supports LLMs and Vision Transformers (like Clay).
 
-Usage:
-    python train_portable_predictor.py --model_id made-with-clay/Clay --rank 128
+Manual overrides are provided to support custom architectures that Transformers 
+might not natively recognize (e.g., Clay's 'geovit+DOFA').
 """
 
 import torch
@@ -30,43 +30,59 @@ def train(args):
     print(f"--- Portable Predictor Trainer ---")
     print(f"Target Model: {args.model_id}")
     
-    # 1. Setup Model and Architecture Info
-    # trust_remote_code=True is essential for custom architectures like geovit+DOFA
-    try:
-        config = AutoConfig.from_pretrained(args.model_id, trust_remote_code=True)
-    except Exception as e:
-        print(f"Error loading config: {e}\nEnsure you've installed any model-specific packages (e.g., Clay).")
-        return
-
-    # Dynamically detect architecture dims
-    d_model = getattr(config, "hidden_size", getattr(config, "d_model", None))
-    d_ffn = getattr(config, "intermediate_size", getattr(config, "ffn_dim", None))
-    num_layers = getattr(config, "num_hidden_layers", getattr(config, "num_layers", None))
+    # 1. Setup Architecture Info (Config or Manual)
+    d_model, d_ffn, num_layers = args.hidden_size, args.ffn_dim, args.num_layers
     
     if not all([d_model, d_ffn, num_layers]):
-        print(f"Error: Could not auto-detect dims. Found Hidden={d_model}, FFN={d_ffn}, Layers={num_layers}")
+        print("Attempting to auto-detect architecture from Transformers...")
+        try:
+            config = AutoConfig.from_pretrained(args.model_id, trust_remote_code=True)
+            d_model = d_model or getattr(config, "hidden_size", getattr(config, "d_model", None))
+            d_ffn = d_ffn or getattr(config, "intermediate_size", getattr(config, "ffn_dim", None))
+            num_layers = num_layers or getattr(config, "num_hidden_layers", getattr(config, "num_layers", None))
+        except Exception as e:
+            print(f"Auto-detection failed: {e}")
+            print("Please provide --hidden_size, --ffn_dim, and --num_layers manually.")
+            return
+
+    if not all([d_model, d_ffn, num_layers]):
+        print(f"Error: Incomplete dimensions. Found Hidden={d_model}, FFN={d_ffn}, Layers={num_layers}")
         return
 
-    print(f"Detected: Hidden={d_model}, FFN={d_ffn}, Layers={num_layers}")
+    print(f"Using Arch: Hidden={d_model}, FFN={d_ffn}, Layers={num_layers}")
 
-    # Use AutoModel instead of CausalLM for non-text models (like Clay ViT)
+    # 2. Load Model Weights
     print("Loading model weights...")
     try:
         if args.is_causal:
             model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
         else:
-            model = AutoModel.from_pretrained(args.model_id, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
+            # For Clay/ViT models
+            try:
+                model = AutoModel.from_pretrained(args.model_id, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
+            except ValueError as ve:
+                if "geovit+DOFA" in str(ve) and "clay" in args.model_id.lower():
+                    print("Registering custom 'geovit+DOFA' via claymodel library...")
+                    from claymodel.module import ClayMAEModule
+                    if args.ckpt_path:
+                        model = ClayMAEModule.load_from_checkpoint(args.ckpt_path)
+                    else:
+                        print("Error: For custom Clay architecture, please provide --ckpt_path to the .ckpt file.")
+                        return
+                else: raise ve
     except Exception as e:
         print(f"Model load failed: {e}")
+        if "401" in str(e) or "gated" in str(e):
+            print("\nCRUCIAL: This model requires login. Run 'huggingface-cli login' first.")
         return
         
     model.eval()
 
-    # 2. Initialize Predictors
+    # 3. Initialize Predictors
     predictors = [LowRankPredictor(d_model, args.rank, d_ffn).cuda() for _ in range(num_layers)]
     optimizers = [optim.Adam(p.parameters(), lr=1e-4) for p in predictors]
     
-    # 3. Activation Capture Logic
+    # 4. Activation Capture Logic
     activations = {}
     def get_hook(idx):
         def hook(m, i, o):
@@ -74,34 +90,29 @@ def train(args):
             activations[idx] = (act_data > 0).float().detach()
         return hook
 
-    # Register hooks on FFN activation functions
     hooks = []
+    # Flexible module search for hooks
     for i in range(num_layers):
         layer_mod = None
-        # Logic to find the activation module (Architecture Dependent)
-        # 1. Llama-style
-        if hasattr(model, "model") and hasattr(model.model, "layers"): 
-            layer_mod = model.model.layers[i].mlp.act_fn
-        # 2. OPT-style
-        elif hasattr(model, "model") and hasattr(model.model.decoder, "layers"):
-            layer_mod = model.model.decoder.layers[i].activation_fn
-        # 3. ViT / Clay-style (Assuming standard timm/vit blocks)
-        elif hasattr(model, "blocks"):
-            layer_mod = model.blocks[i].mlp.act # Standard ViT act
-        elif hasattr(model, "model") and hasattr(model.model, "blocks"):
-            layer_mod = model.model.blocks[i].mlp.act
+        # 1. HuggingFace standard CausalLM (Llama/OPT)
+        if hasattr(model, "model"):
+            sub = model.model
+            if hasattr(sub, "layers"): layer_mod = sub.layers[i].mlp.act_fn # Llama
+            elif hasattr(sub, "decoder") and hasattr(sub.decoder, "layers"): # OPT
+                layer_mod = sub.decoder.layers[i].activation_fn
+        # 2. Vision / Custom (Clay)
+        elif hasattr(model, "blocks"): layer_mod = model.blocks[i].mlp.act
+        elif hasattr(model, "model") and hasattr(model.model, "blocks"): layer_mod = model.model.blocks[i].mlp.act
 
         if layer_mod:
             hooks.append(layer_mod.register_forward_hook(get_hook(i)))
         else:
-            print(f"Warning: Activation module not found for layer {i}")
+            print(f"Warning: Activation layer {i} not found. Capture will fail.")
 
-    # 4. Training Loop
-    # For Clay, we'd ideally use SAR data, but C4 works for general feature capture.
+    # 5. Training Loop
     dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
     pbar = tqdm(total=args.samples, desc="Training")
     
-    # Simple mock tokenizer if not provided (for non-text models)
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     except:
@@ -110,30 +121,37 @@ def train(args):
     for i, sample in enumerate(dataset):
         if i >= args.samples: break
         
-        if tokenizer:
-            inputs = tokenizer(sample['text'], return_tensors="pt", truncation=True, max_length=128).to("cuda")
-            with torch.no_grad(): outputs = model(**inputs, output_hidden_states=True)
-        else:
-            # For Vision models, we'd need dummy pixels or real images
-            # This logic would need expansion for pure image models.
-            print("Non-text model detected. Script requires expansion for image dataset loading.")
-            break
-            
-        for l_idx in range(num_layers):
-            x = outputs.hidden_states[l_idx].detach().float()
-            y_true = activations[l_idx].float()
-            
-            optimizers[l_idx].zero_grad()
-            y_pred = predictors[l_idx](x)
-            loss = nn.BCELoss()(y_pred, y_true)
-            loss.backward()
-            optimizers[l_idx].step()
-        pbar.update(1)
+        try:
+            if tokenizer:
+                inputs = tokenizer(sample['text'], return_tensors="pt", truncation=True, max_length=128).to("cuda")
+                with torch.no_grad(): outputs = model(**inputs, output_hidden_states=True)
+            else:
+                # Dummy vision input if no tokenizer
+                dummy_x = torch.randn(1, 3, 224, 224).cuda()
+                with torch.no_grad(): outputs = model(dummy_x, output_hidden_states=True)
+                
+            for l_idx in range(num_layers):
+                h_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else []
+                if not h_states: break
+                
+                x = h_states[l_idx].detach().float()
+                y_true = activations.get(l_idx)
+                if y_true is None: continue
+                
+                optimizers[l_idx].zero_grad()
+                y_pred = predictors[l_idx](x)
+                loss = nn.BCELoss()(y_pred, y_true.float())
+                loss.backward()
+                optimizers[l_idx].step()
+            pbar.update(1)
+        except Exception as e:
+            print(f"Sample {i} failed: {e}")
+            continue
     
     for h in hooks: h.remove()
     pbar.close()
 
-    # 5. Export
+    # 6. Export
     base_name = args.model_id.split("/")[-1]
     bin_path = f"{base_name}_predictors.bin"
     meta_path = f"{base_name}_predictors.json"
@@ -148,12 +166,16 @@ def train(args):
         "num_layers": num_layers, "rank": args.rank, "dtype": "float32"
     }
     with open(meta_path, "w") as f: json.dump(metadata, f, indent=4)
-    print(f"Exported to {bin_path}. Copy to edge device.")
+    print(f"Done! Exported to {bin_path}.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Agnostic Predictor Trainer.")
     parser.add_argument("--model_id", type=str, default="facebook/opt-6.7b")
+    parser.add_argument("--ckpt_path", type=str, help="Path to .ckpt (for custom models like Clay)")
+    parser.add_argument("--hidden_size", type=int, help="Manual Hidden Size override")
+    parser.add_argument("--ffn_dim", type=int, help="Manual FFN Dim override")
+    parser.add_argument("--num_layers", type=int, help="Manual Layers override")
     parser.add_argument("--samples", type=int, default=1000)
     parser.add_argument("--rank", type=int, default=128)
-    parser.add_argument("--is_causal", action="store_true", help="Use CausalLM loader (for LLMs)")
+    parser.add_argument("--is_causal", action="store_true", help="Set for LLMs")
     train(parser.parse_args())
