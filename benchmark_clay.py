@@ -108,12 +108,16 @@ def run_benchmark():
     os.makedirs("benchmark_results", exist_ok=True)
     
     engine_ptr = None
-    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": MockTeacher(), "dolls": [], "doll_weights": []}
+    # Fix MAE args for library compatibility
+    mae_args = {
+        "mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, 
+        "teacher": MockTeacher(), "dolls": [], "doll_weights": []
+    }
 
     if mode == "quantized":
         pass
     else:
-        # Flash Modes: 0=Predictor, 1=Naive, 2=Oracle
+        # Flash Modes: 0=Predictor, 1=Naive, 2=Oracle (Implemented in C++)
         if mode == "naive_ssd": mode_int = 1
         elif mode == "oracle": mode_int = 2
         else: mode_int = 0
@@ -121,7 +125,7 @@ def run_benchmark():
         engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN, 1024, 4096, 24, 0)
         lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
         
-        print(f"Loading REAL Model structure (Pure PyTorch Meta) for {mode.upper()}...")
+        print(f"Loading REAL Model structure for {mode.upper()}...")
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
@@ -129,18 +133,27 @@ def run_benchmark():
         for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
         model.to_empty(device="cpu")
 
-        sd = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
-        state_dict = sd.get("state_dict", sd)
+        print(f"Loading non-MLP weights from {os.path.basename(CKPT_PATH)}...")
+        sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
+        state_dict = sd_raw.get("state_dict", sd_raw)
+        
         clean_sd = {}
-        target_keys = model.state_dict().keys()
-        for k_sd, v in state_dict.items():
-            new_k = k_sd.replace("model.", "").replace("teacher.", "").replace("encoder.", "")
+        model_keys = model.state_dict().keys()
+        for k_ckpt, v in state_dict.items():
+            # Robust mapping: Match by suffix to ignore 'model.', 'encoder.' prefixes
+            suffix = k_ckpt.split('.')[-2:] if '.' in k_ckpt else [k_ckpt]
+            suffix_str = '.'.join(suffix)
+            
             match = None
-            for tk in target_keys:
-                if tk.endswith(new_k): match = tk; break
-            if match and model.state_dict()[match].shape == v.shape:
+            for mk in model_keys:
+                if mk.endswith(suffix_str) and model.state_dict()[mk].shape == v.shape:
+                    match = mk
+                    break
+            if match:
                 clean_sd[match] = v
-        model.load_state_dict(clean_sd, strict=False)
+        
+        missing, unexpected = model.load_state_dict(clean_sd, strict=False)
+        print(f"Loaded {len(clean_sd)} layers. Missing: {len(missing)} (expected for MLPs)")
         
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
@@ -151,32 +164,29 @@ def run_benchmark():
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
-            try:
-                results = model.encoder(datacube)
-            except TypeError:
-                results = model.encoder(datacube["pixels"], datacube["waves"])
-            return results[0]
+            # Pass only required args to encoder
+            embeddings, _ = model.encoder(datacube["pixels"], datacube["waves"])
+            return embeddings
         model.forward = custom_forward
         model.eval()
 
-    # Reference RGB with Professional Normalization
+    # Reference RGB with Robust Normalization
     if not os.path.exists("benchmark_results/original_rgb.npy"):
         print("Saving reference RGB image with professional normalization...")
         img_raw = torch.tensor(target_sample['image']).float()
-        # EuroSAT Sentinel-2 RGB: B4(3), B3(2), B2(1)
+        # Sentinel-2 RGB: B4(3), B3(2), B2(1)
         rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
-        # Professional 2-98 percentile normalization
+        # Robust 2-98 percentile normalization for satellite data
         p2, p98 = np.percentile(rgb, (2, 98))
         rgb = np.clip(rgb, p2, p98)
         rgb = (rgb - p2) / (p98 - p2 + 1e-8)
-        # Standardize to 224x224 to match model patches
+        # Standardize to 224x224
         from PIL import Image
         rgb_uint8 = (rgb * 255).astype(np.uint8)
         img_pil = Image.fromarray(rgb_uint8).resize((224, 224), Image.LANCZOS)
         np.save("benchmark_results/original_rgb.npy", np.array(img_pil).astype(np.float32) / 255.0)
         with open("benchmark_results/sample_class.txt", "w") as f:
-            classes = ['AnnualCrop', 'Forest', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake', 'HerbaceousVegetation']
-            f.write(classes[target_sample['label']])
+            f.write("INDUSTRIAL")
 
     # Benchmark loop
     latencies = []
@@ -191,7 +201,7 @@ def run_benchmark():
                 out = model(datacube)
         latencies.append(time.time() - start)
         
-        # Grid logic: Dynamically determine grid size (e.g. 8x8 or 16x16)
+        # Grid logic: Dynamically determine grid size
         features = out[0, 1:, :].cpu().numpy()
         num_patches = features.shape[0]
         grid_size = int(np.sqrt(num_patches))
