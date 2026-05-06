@@ -201,6 +201,27 @@ public:
                     if (scores[i].first > threshold) union_active_set.insert(scores[i].second);
                 }
             }
+        } else if (mode == 2) { // ORACLE MODE: Perfect Knowledge calculation
+            for (int t = 0; t < n_tokens; ++t) {
+                float* x = in_batch + t * hidden_size;
+                uint8_t* layer_base = ffn_mapped + (size_t)layer_idx * ffn_dim * bytes_per_ssd_neuron;
+                std::vector<std::pair<float, int>> actual_scores(ffn_dim);
+                
+                #pragma omp parallel for
+                for (size_t n = 0; n < ffn_dim; ++n) {
+                    uint16_t* src_h = (uint16_t*)(layer_base + (size_t)n * bytes_per_ssd_neuron);
+                    float sum = 0.0f;
+                    // Compute ground truth activation (Gate/FC1 only)
+                    for(size_t h=0; h<hidden_size; ++h) sum += h2f(src_h[h]) * x[h];
+                    if (!is_llama3 && fc1_bias) sum += fc1_bias[n];
+                    actual_scores[n] = {std::abs(sum), (int)n};
+                }
+
+                std::nth_element(actual_scores.begin(), actual_scores.begin() + top_k, actual_scores.end(),
+                    [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+                
+                for (int i = 0; i < top_k; i++) union_active_set.insert(actual_scores[i].second);
+            }
         } else if (mode == 1 || (mode == 0 && !predictor_mapped)) {
             for (int i=0; i<(int)ffn_dim; ++i) union_active_set.insert(i);
         }

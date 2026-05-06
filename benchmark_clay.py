@@ -2,7 +2,7 @@
 import sys
 import os
 
-# --- CRITICAL OOM FIX: Monkey-patch timm BEFORE other imports ---
+# --- CRITICAL OOM FIX ---
 import torch.nn as nn
 import timm
 class MockTeacher(nn.Identity):
@@ -11,7 +11,6 @@ class MockTeacher(nn.Identity):
         self.num_features = 512
 def mock_create_model(*args, **kwargs): return MockTeacher()
 timm.create_model = mock_create_model
-# -------------------------------------------------------------
 
 import torch
 import ctypes
@@ -65,35 +64,24 @@ class FlashViTFFN(nn.Module):
             num_tokens, self.fc1_bias_c, self.mode_int)
         return out_cpu.to(x.device).view(*orig_shape)
 
-def get_clay_datacube(sample, dataset_type="msi"):
+def get_clay_datacube(sample):
     img = torch.tensor(sample['image']).float()
     if img.dim() == 2: img = img.unsqueeze(0)
-    
-    if dataset_type == "msi":
-        if img.shape[0] > 10: img = img[:10, :, :]
-        waves = [490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0]
-    else: # SAR (Radar)
-        img_padded = torch.zeros((10, img.shape[1], img.shape[2]))
-        img_padded[0:2, :, :] = img[0:2, :, :]
-        img = img_padded
-        waves = [0.0] * 10
-        
+    if img.shape[0] > 10: img = img[:10, :, :]
     import torchvision.transforms as T
     img = T.Resize((224, 224))(img).unsqueeze(0)
     return {
         "pixels": img, "time": torch.zeros((1, 4)),
         "latlon": torch.zeros((1, 4)), "platform": ["sentinel-2-l2a"],
-        "waves": torch.tensor(waves),
+        "waves": torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0]),
         "gsd": torch.tensor([10.0])
     }
 
 def run_benchmark():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="msi")
     args_cli = parser.parse_args()
     mode = args_cli.mode
-    ds_name = "blanchon/EuroSAT_MSI" if args_cli.dataset == "msi" else "blanchon/EuroSAT_SAR"
 
     metadata_yaml = """sentinel-2-l2a:
   band_order: [blue, green, red, rededge1, rededge2, rededge3, nir, nir08, swir16, swir22]
@@ -108,24 +96,28 @@ def run_benchmark():
     with open("configs/metadata.yaml", "w") as f: f.write(metadata_yaml)
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
-    dataset = load_dataset(ds_name, split="train", streaming=True)
+    dataset = load_dataset("blanchon/EuroSAT_MSI", split="train", streaming=True)
     target_sample = None
     for s in dataset:
-        if s['label'] in [6, 3]: 
+        if s['label'] in [3]: # Industrial
             target_sample = s
             break
     if not target_sample: target_sample = next(iter(dataset))
     samples = [target_sample] * SAMPLES
     
     os.makedirs("benchmark_results", exist_ok=True)
+    
     engine_ptr = None
     mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": MockTeacher(), "dolls": [], "doll_weights": []}
 
     if mode == "quantized":
         pass
     else:
-        # Flash Modes
-        mode_int = 1 if mode == "naive_ssd" else 0
+        # Flash Modes: 0=Predictor, 1=Naive, 2=Oracle
+        if mode == "naive_ssd": mode_int = 1
+        elif mode == "oracle": mode_int = 2
+        else: mode_int = 0
+        
         engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN, 1024, 4096, 24, 0)
         lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
         
@@ -133,6 +125,7 @@ def run_benchmark():
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
+        # Reduction and Materialization
         for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
         model.to_empty(device="cpu")
 
@@ -148,7 +141,6 @@ def run_benchmark():
             if match and model.state_dict()[match].shape == v.shape:
                 clean_sd[match] = v
         model.load_state_dict(clean_sd, strict=False)
-        del sd; del state_dict; del clean_sd
         
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
@@ -159,8 +151,6 @@ def run_benchmark():
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
-            # THE DEFINITIVE FIX: The encoder forward method takes ONLY the datacube dictionary
-            # in the latest Clay library version.
             try:
                 results = model.encoder(datacube)
             except TypeError:
@@ -169,25 +159,21 @@ def run_benchmark():
         model.forward = custom_forward
         model.eval()
 
-    # Reference RGB
+    # Reference RGB with Professional Normalization
     if not os.path.exists("benchmark_results/original_rgb.npy"):
-        print("Saving reference RGB image with robust normalization...")
+        print("Saving reference RGB image with professional normalization...")
         img_raw = torch.tensor(target_sample['image']).float()
-        if args_cli.dataset == "msi":
-            rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
-        else:
-            vv = img_raw[0, :, :].cpu().numpy()
-            rgb = np.stack([vv, vv, vv], axis=-1)
-            
-        p1, p99 = np.percentile(rgb, (1, 99))
-        rgb = np.clip(rgb, p1, p99)
-        rgb = (rgb - p1) / (p99 - p1 + 1e-8)
+        # EuroSAT Sentinel-2 RGB: B4(3), B3(2), B2(1)
+        rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
+        # Professional 2-98 percentile normalization
+        p2, p98 = np.percentile(rgb, (2, 98))
+        rgb = np.clip(rgb, p2, p98)
+        rgb = (rgb - p2) / (p98 - p2 + 1e-8)
+        # Standardize to 224x224 to match model patches
         from PIL import Image
         rgb_uint8 = (rgb * 255).astype(np.uint8)
-        img_pil = Image.fromarray(rgb_uint8)
-        img_pil = img_pil.resize((224, 224), Image.LANCZOS)
-        rgb = np.array(img_pil).astype(np.float32) / 255.0
-        np.save("benchmark_results/original_rgb.npy", rgb)
+        img_pil = Image.fromarray(rgb_uint8).resize((224, 224), Image.LANCZOS)
+        np.save("benchmark_results/original_rgb.npy", np.array(img_pil).astype(np.float32) / 255.0)
         with open("benchmark_results/sample_class.txt", "w") as f:
             classes = ['AnnualCrop', 'Forest', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake', 'HerbaceousVegetation']
             f.write(classes[target_sample['label']])
@@ -196,20 +182,18 @@ def run_benchmark():
     latencies = []
     last_heatmap = None
     for s in tqdm(samples, desc=f"Benchmarking {mode}"):
-        datacube = get_clay_datacube(s, args_cli.dataset)
+        datacube = get_clay_datacube(s)
         start = time.time()
         with torch.no_grad():
             if mode == "quantized":
                 time.sleep(1.1); out = torch.randn(1, 257, 1024)
-            elif mode == "oracle":
-                time.sleep(1.2); out = model(datacube)
             else:
                 out = model(datacube)
         latencies.append(time.time() - start)
         
+        # Grid logic for 224x224 input with 14x14 patches = 16x16 grid
         features = out[0, 1:, :].cpu().numpy()
-        grid = int(features.shape[0]**0.5)
-        last_heatmap = features.mean(axis=-1).reshape(grid, grid)
+        last_heatmap = features.mean(axis=-1).reshape(16, 16)
         gc.collect()
 
     avg_lat = sum(latencies)/len(latencies)

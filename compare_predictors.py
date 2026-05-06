@@ -7,6 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import pandas as pd
 import shutil
 import gc
+import matplotlib.pyplot as plt
 
 # --- Config ---
 DRIVE = "/mnt/wsl/PHYSICALDRIVE0p3/"
@@ -25,7 +26,6 @@ class LowRankPredictor(nn.Module):
         self.down = nn.Linear(d_model, rank, bias=False)
         self.up = nn.Linear(rank, d_ffn, bias=False)
     def forward(self, x):
-        # Handle both 1D and 2D inputs
         if x.dim() == 1: x = x.unsqueeze(0)
         return torch.sigmoid(self.up(torch.relu(self.down(x))))
 
@@ -36,7 +36,6 @@ def detect_rank(path, hs, fd, nl):
 
 def load_predictor(path, hs, fd, nl):
     rank = detect_rank(path, hs, fd, nl)
-    print(f"Loading {os.path.basename(path)} (Rank {rank})")
     predictors = [LowRankPredictor(hs, rank, fd) for _ in range(nl)]
     with open(path, "rb") as f:
         for p in predictors:
@@ -49,7 +48,6 @@ def load_predictor(path, hs, fd, nl):
 def compare(model_key):
     cfg = MODELS[model_key]
     print(f"\n=== Comparing Predictors for {model_key.upper()} ===")
-    
     offload = f"offload_{model_key}"
     os.makedirs(offload, exist_ok=True)
     
@@ -68,32 +66,37 @@ def compare(model_key):
         def get_hook(idx):
             def hook(m, i, o):
                 acts = o[0] if isinstance(o, tuple) else o
-                # OPT activation_fn output can be (seq, ffn_dim) or (batch, seq, ffn_dim)
                 if acts.dim() == 3: acts = acts[0]
-                # Store only the last token
                 captured_acts[idx] = (acts[-1, :] > 0).float().detach().cpu()
             return hook
         
-        hooks = []
-        for i in range(cfg["nl"]):
-            layer = model.model.decoder.layers[i].activation_fn
-            hooks.append(layer.register_forward_hook(get_hook(i)))
+        hooks = [model.model.decoder.layers[i].activation_fn.register_forward_hook(get_hook(i)) for i in range(cfg["nl"])]
 
         text = "Artificial intelligence is a branch of computer science."
         inputs = tokenizer(text, return_tensors="pt")
         
+        start = time.time()
         with torch.no_grad():
             outputs = model(**inputs, output_hidden_states=True)
+        dense_time = time.time() - start
+
+        # Benchmark predictor speed (Simulated pass of small model)
+        x = outputs.hidden_states[0][0, -1, :].float().cpu()
         
+        start_old = time.time()
+        for i in range(cfg["nl"]): _ = old_p[i](x)
+        old_pred_time = time.time() - start_old
+        
+        start_new = time.time()
+        for i in range(cfg["nl"]): _ = new_p[i](x)
+        new_pred_time = time.time() - start_new
+
         results = []
         for i in range(cfg["nl"]):
-            # hidden_states is (batch, seq, hidden_size)
-            x = outputs.hidden_states[i][0, -1, :].float().cpu()
+            x_layer = outputs.hidden_states[i][0, -1, :].float().cpu()
             y_true = captured_acts[i]
-            
-            with torch.no_grad():
-                y_old = (old_p[i](x).squeeze() > 0.5).float()
-                y_new = (new_p[i](x).squeeze() > 0.5).float()
+            y_old = (old_p[i](x_layer).squeeze() > 0.5).float()
+            y_new = (new_p[i](x_layer).squeeze() > 0.5).float()
             
             recall_old = (y_old * y_true).sum() / (y_true.sum() + 1e-6)
             recall_new = (y_new * y_true).sum() / (y_true.sum() + 1e-6)
@@ -101,16 +104,38 @@ def compare(model_key):
         
         for h in hooks: h.remove()
         df = pd.DataFrame(results)
-        print(f"Old Mean Recall: {df['old'].mean():.2%}")
-        print(f"New GCP Recall: {df['new'].mean():.2%}")
-        print(f"Improvement: {df['new'].mean() - df['old'].mean():+.2%}")
         
+        # --- Graphing ---
+        plt.switch_backend('Agg')
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Recall (Accuracy)
+        ax1.bar(["Old (Local)", "New (GCP)"], [df['old'].mean()*100, df['new'].mean()*100], color=['blue', 'green'], alpha=0.7)
+        ax1.set_ylabel("Mean Recall (%)", fontweight='bold')
+        ax1.set_title("Predictor Accuracy: GCP vs Local", fontweight='bold')
+        ax1.set_ylim(40, 100)
+        for i, v in enumerate([df['old'].mean()*100, df['new'].mean()*100]):
+            ax1.text(i, v + 1, f"{v:.1f}%", ha='center', fontweight='bold')
+
+        # Speed (Efficiency)
+        ax2.bar(["Old (Rank 240)", "New (Rank 128)"], [old_pred_time*1000, new_pred_time*1000], color=['darkred', 'orange'], alpha=0.7)
+        ax2.set_ylabel("Inference Latency (ms)", fontweight='bold')
+        ax2.set_title("Predictor Speed: Rank Comparison", fontweight='bold')
+        for i, v in enumerate([old_pred_time*1000, new_pred_time*1000]):
+            ax2.text(i, v + 0.1, f"{v:.2f}ms", ha='center', fontweight='bold')
+
+        plt.suptitle(f"REAL DATA: Predictor Comparison for {model_key.upper()}\n(Validated on live sequence)", fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig("predictor_gcp_vs_local.png", dpi=150)
+        print("Generated 'predictor_gcp_vs_local.png'.")
+
     except Exception as e:
-        print(f"Comparison failed for {model_key}: {e}")
+        print(f"Comparison failed: {e}")
     finally:
         if 'model' in locals(): del model
         gc.collect()
         if os.path.exists(offload): shutil.rmtree(offload)
 
 if __name__ == "__main__":
+    import time
     compare("opt")
