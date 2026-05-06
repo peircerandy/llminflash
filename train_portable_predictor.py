@@ -210,117 +210,93 @@ sentinel-1-rtc:
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-for i, sample in enumerate(dataset):
-    if i >= args.samples: break
 
-    try:
-        captured_inputs.clear()
-        captured_acts.clear()
-
-        if args.is_causal:
-            # Ensure we have text data for causal models
-            text = None
-            for key in ['text', 'content', 'body']:
-                if key in sample:
-                    text = sample[key]
-                    break
-            if text is None:
-                print(f"\nError: Model is causal (LLM) but dataset has no text field. Skipping.")
-                break
-
-            if tokenizer:
-                # Keep indices as Long! Only activations/inputs for predictors will be Float
-                inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128).to("cuda")
-                with torch.no_grad(): model(**inputs)
-        elif not args.is_causal:
-            # Vision/Custom data handling
-            img = None
-...
-                # Flexible field search
-                for key in ['image', 'img', 'pixels', 'pixel_values', 'MSI']:
-                    if key in sample:
-                        img = sample[key]
-                        break
+    for i, sample in enumerate(dataset):
+        if i >= args.samples: break
+        
+        try:
+            captured_inputs.clear()
+            captured_acts.clear()
+            
+            if args.is_causal:
+                # --- LLM Path ---
+                text = None
+                for key in ['text', 'content', 'body']:
+                    if key in sample: text = sample[key]; break
                 
-                if img is None:
+                if text is None:
+                    print(f"\nWarning: Sample {i} has no text field. Skipping.")
+                    continue
+                
+                if tokenizer:
+                    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128).to("cuda")
+                    with torch.no_grad(): model(**inputs)
+                else:
+                    print("Error: No tokenizer found for causal model.")
+                    break
+                    
+            else:
+                # --- Vision Path ---
+                img_data = None
+                for key in ['image', 'img', 'pixels', 'pixel_values', 'MSI']:
+                    if key in sample: img_data = sample[key]; break
+                
+                if img_data is None:
                     print(f"\nWarning: Sample {i} has no recognizable image field. Skipping.")
                     continue
 
-                # 1. Convert to Tensor [C, H, W]
-                if isinstance(img, list):
-                    img = torch.tensor(img).float()
+                # Preprocess
+                if isinstance(img_data, list): img = torch.tensor(img_data).float()
+                elif not isinstance(img_data, torch.Tensor):
+                    if hasattr(img_data, "convert"): img = preprocess(img_data.convert("RGB"))
+                    else: img = transforms.ToTensor()(img_data)
+                else: img = img_data
                 
-                if not isinstance(img, torch.Tensor):
-                    # PIL Image
-                    if hasattr(img, "convert"):
-                        img = preprocess(img.convert("RGB"))
-                    else:
-                        img = transforms.ToTensor()(img)
-                
-                # Now we have a tensor [C, H, W]
-                if img.dim() == 2: # H, W
-                    img = img.unsqueeze(0)
-                
-                # 2. Consistently Resize to 224x224 (Standard ViT/Clay size)
-                # This ensures the patch count (224/8 = 28) matches internal model expectations
+                if img.dim() == 2: img = img.unsqueeze(0)
                 if img.shape[-1] != 224 or img.shape[-2] != 224:
                     img = transforms.Resize((224, 224))(img)
-
-                # 3. Ensure Batch Dim
+                
                 img = img.unsqueeze(0).to("cuda").float()
                 
-                # 4. Ensure correct channel count for the model
-                # Clay v1.5 expects 10 bands for sentinel-2-l2a
+                # Channel Match
                 expected_channels = 10 if "clay" in args.model_id.lower() else 3
                 if img.shape[1] != expected_channels:
                     if img.shape[1] < expected_channels:
-                        # Pad with zeros
                         pad = torch.zeros((img.shape[0], expected_channels - img.shape[1], img.shape[2], img.shape[3]), device="cuda")
                         img = torch.cat([img, pad], dim=1)
-                    else:
-                        # Slice
-                        img = img[:, :expected_channels, :, :]
+                    else: img = img[:, :expected_channels, :, :]
 
-                # Forward pass for Clay (datacube) or standard vision
                 with torch.no_grad():
                     if "clay" in args.model_id.lower():
-                        # ClayMAEModule expects a datacube dictionary. 
-                        # Platform MUST be a list to avoid string indexing error platform[0] -> 's'
                         datacube = {
                             "pixels": img,
                             "time": torch.zeros((img.shape[0], 4), device="cuda"),
                             "latlon": torch.zeros((img.shape[0], 4), device="cuda"),
-                            "platform": ["sentinel-2-l2a"] * img.shape[0]
+                            "platform": ["sentinel-2-l2a"] * img.shape[0],
+                            "waves": torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0], device="cuda"),
+                            "gsd": torch.tensor([10.0], device="cuda")
                         }
+                        # ClayMAE forward()
                         model(datacube)
                     else:
                         model(img)
-            else:
-                print("\nError: Incompatible model/dataset configuration. Use --is_causal for LLMs.")
-                break
-                
+
+            # --- Unified Predictor Training ---
             for l_idx in range(num_layers):
                 x = captured_inputs.get(l_idx)
                 y_true = captured_acts.get(l_idx)
                 
                 if x is None or y_true is None: continue
-                
-                # Ensure x and y_true are compatible
-                if x.shape[0] != y_true.shape[0]:
-                    # Batch or token mismatch, flatten if needed or skip
-                    continue
+                if x.shape[0] != y_true.shape[0]: continue
 
                 optimizers[l_idx].zero_grad()
                 y_pred = predictors[l_idx](x)
-                
-                # BCELoss requires same shape. ViT tokens might need flattening.
                 loss = nn.BCELoss()(y_pred.view(-1), y_true.view(-1).float())
                 loss.backward()
                 optimizers[l_idx].step()
             pbar.update(1)
         except Exception as e:
-            if i % 100 == 0: # Only print every 100th error to avoid flooding
-                print(f"Sample {i} failed: {e}")
+            if i % 100 == 0: print(f"Sample {i} failed: {e}")
             continue
     
     for h in hooks: h.remove()
