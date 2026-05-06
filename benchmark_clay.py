@@ -191,9 +191,11 @@ def run_benchmark():
                 out = model(datacube)
         latencies.append(time.time() - start)
         
-        # Grid logic for 224x224 input with 14x14 patches = 16x16 grid
+        # Grid logic: Dynamically determine grid size (e.g. 8x8 or 16x16)
         features = out[0, 1:, :].cpu().numpy()
-        last_heatmap = features.mean(axis=-1).reshape(16, 16)
+        num_patches = features.shape[0]
+        grid_size = int(np.sqrt(num_patches))
+        last_heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
         gc.collect()
 
     avg_lat = sum(latencies)/len(latencies)
