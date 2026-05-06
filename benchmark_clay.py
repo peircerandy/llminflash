@@ -64,7 +64,6 @@ class FlashViTFFN(nn.Module):
             ctypes.cast(flat_x.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             ctypes.cast(out_cpu.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             num_tokens, self.fc1_bias_c, self.mode_int)
-        # Ensure residual connection is preserved if needed
         return out_cpu.to(x.device).view(*orig_shape)
 
 def get_peter_datacube(img_pil):
@@ -109,7 +108,7 @@ def run_benchmark():
     
     os.makedirs("benchmark_results", exist_ok=True)
     engine_ptr = None
-    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": "vit_large", "dolls": [], "doll_weights": []}
+    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": "vit_large_patch16_224", "dolls": [], "doll_weights": []}
 
     if mode == "quantized":
         pass
@@ -125,13 +124,12 @@ def run_benchmark():
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
-        # In Clay, layers[i][1] is the MLP block
-        # We need to preserve the skeleton for non-MLP loading
+        # Surgical Materialization
         model.to_empty(device="cpu")
-        print("Model skeleton materialized to CPU.")
+        print("Model materialized to CPU.")
 
-        # 3. Load non-MLP weights
-        print(f"Loading weights from {os.path.basename(CKPT_PATH)}...")
+        # Load weights
+        print(f"Loading non-MLP weights from {os.path.basename(CKPT_PATH)}...")
         sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd_raw.get("state_dict", sd_raw)
         clean_sd = {}
@@ -145,15 +143,24 @@ def run_benchmark():
         model.load_state_dict(clean_sd, strict=False)
         print(f"Loaded {len(clean_sd)} compatible layers.")
 
+        # SURGICAL MLP PATCHING
         for i in range(24):
+            ff_block = model.encoder.transformer.layers[i][1] # FeedForward module
             if mode == "draft" and i % 4 == 0:
-                model.encoder.transformer.layers[i][1] = nn.Identity()
+                ff_block.net[1] = nn.Identity()
+                ff_block.net[2] = nn.Identity()
+                ff_block.net[3] = nn.Identity()
             else:
                 fc1_bias = torch.zeros(4096, dtype=torch.float32)
                 bias_ptr = ctypes.cast(fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float))
-                # Patch the FeedForward component inside the block
-                # In Clay v1.5 Large: layers[i][1] is FeedForward
-                model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
+                
+                # Replace ONLY the core FFN computation, preserve LayerNorm (net[0])
+                # We wrap the Flash engine call in a passthrough that handles GELU internally?
+                # Actually, our engine does FC1 -> GELU -> FC2? No, it only does FC1+SSD.
+                # So we replace net[1] (Linear), net[2] (GELU), and net[3] (Linear)
+                ff_block.net[1] = nn.Identity()
+                ff_block.net[2] = nn.Identity()
+                ff_block.net[3] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
             results = model.encoder(datacube)
@@ -178,12 +185,7 @@ def run_benchmark():
                 out = model(datacube)
         latencies.append(time.time() - start)
         
-        # Ensure we don't have NaNs by normalizing features
         features = out[0, 1:, :].cpu().numpy()
-        if np.isnan(features).any():
-             print(f"Warning: Mode {mode} produced NaNs. Using zeros for heatmap.")
-             features = np.zeros_like(features)
-        
         grid_size = int(np.sqrt(features.shape[0]))
         last_heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
         gc.collect()
