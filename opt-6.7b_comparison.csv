@@ -1,0 +1,4 @@
+Model,Mode,TPS,Accuracy
+opt-6.7b,quantized,1.4389979817768086,100.0
+opt-6.7b,predictor,0.005239050901135349,0.0
+opt-6.7b,speculative,0.0054321405107887475,0.0

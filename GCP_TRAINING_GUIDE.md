@@ -129,7 +129,14 @@ python ~/llminflash/train_portable_predictor.py \
     --rank 128 \
     --is_causal
 
+# For OPT-6.7B (Note the --is_causal flag for LLMs)
+python ~/llminflash/train_portable_predictor.py \
+    --model_id facebook/opt-6.7b \
+    --samples 5000 \
+    --is_causal
+
 # For Clay v1.5 (Vision Transformer)
+# Note: DO NOT use --is_causal for vision models.
 python ~/llminflash/train_portable_predictor.py \
     --model_id made-with-clay/Clay \
     --ckpt_path /mnt/trainer-disk/clay-v1.5.ckpt \

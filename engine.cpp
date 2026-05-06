@@ -50,8 +50,10 @@ private:
     std::vector<LayerCache*> caches;
 
     struct PredictorInfo { size_t offset; int rank; };
+public:
     std::vector<PredictorInfo> predictor_infos;
 
+private:
     int top_k = 1024;
     float threshold = 0.5f;
     int window_size = 5;
@@ -93,8 +95,10 @@ public:
 
         size_t current_p_offset = 0;
         for(size_t i=0; i<num_layers; ++i) {
-            caches.push_back(new LayerCache(1024, vals_per_cache_neuron)); 
-            int rank = (i < 28) ? 128 : 1024;
+            caches.push_back(new LayerCache(4096, vals_per_cache_neuron)); 
+            // Hybrid Rank logic: only use 1024 for Llama 3 upper layers.
+            // Clay uses 128 for everything.
+            int rank = (is_llama3 && i >= 28) ? 1024 : 128;
             predictor_infos.push_back({current_p_offset, rank});
             current_p_offset += (size_t)rank * hidden_size + (size_t)ffn_dim * rank;
         }
@@ -158,6 +162,8 @@ public:
     }
 
     void execute_ffn(int layer_idx, float* in_batch, float* out_batch, int n_tokens, float* fc1_bias, int mode) {
+        if (!ffn_mapped) return;
+        
         LayerCache* cache = caches[layer_idx];
         std::set<int> union_active_set;
 

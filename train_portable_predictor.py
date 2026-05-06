@@ -210,20 +210,32 @@ sentinel-1-rtc:
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
+for i, sample in enumerate(dataset):
+    if i >= args.samples: break
 
-    for i, sample in enumerate(dataset):
-        if i >= args.samples: break
-        
-        try:
-            captured_inputs.clear()
-            captured_acts.clear()
-            
-            if args.is_causal and tokenizer:
-                inputs = tokenizer(sample['text'], return_tensors="pt", truncation=True, max_length=128).to("cuda")
+    try:
+        captured_inputs.clear()
+        captured_acts.clear()
+
+        if args.is_causal:
+            # Ensure we have text data for causal models
+            text = None
+            for key in ['text', 'content', 'body']:
+                if key in sample:
+                    text = sample[key]
+                    break
+            if text is None:
+                print(f"\nError: Model is causal (LLM) but dataset has no text field. Skipping.")
+                break
+
+            if tokenizer:
+                # Keep indices as Long! Only activations/inputs for predictors will be Float
+                inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128).to("cuda")
                 with torch.no_grad(): model(**inputs)
-            elif not args.is_causal:
-                # Vision/Custom data handling
-                img = None
+        elif not args.is_causal:
+            # Vision/Custom data handling
+            img = None
+...
                 # Flexible field search
                 for key in ['image', 'img', 'pixels', 'pixel_values', 'MSI']:
                     if key in sample:
