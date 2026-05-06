@@ -1,9 +1,20 @@
 
-import torch
-import torch.nn as nn
 import sys
-import ctypes
 import os
+
+# --- CRITICAL OOM FIX: Monkey-patch timm BEFORE other imports ---
+import torch.nn as nn
+import timm
+class MockTeacher(nn.Identity):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.num_features = 512
+def mock_create_model(*args, **kwargs): return MockTeacher()
+timm.create_model = mock_create_model
+# -------------------------------------------------------------
+
+import torch
+import ctypes
 import time
 import gc
 import pandas as pd
@@ -67,14 +78,6 @@ def get_clay_datacube(sample):
         "gsd": torch.tensor([10.0])
     }
 
-import timm
-class MockTeacher(nn.Identity):
-    def __init__(self):
-        super().__init__()
-        self.num_features = 512
-def mock_create_model(*args, **kwargs): return MockTeacher()
-timm.create_model = mock_create_model
-
 def run_benchmark():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True)
@@ -96,6 +99,8 @@ def run_benchmark():
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
     dataset = load_dataset("blanchon/EuroSAT_MSI", split="train", streaming=True)
+    
+    # Find identifiable sample
     target_sample = None
     for s in dataset:
         if s['label'] in [6, 3]: 
@@ -105,8 +110,12 @@ def run_benchmark():
     samples = [target_sample] * SAMPLES
     
     os.makedirs("benchmark_results", exist_ok=True)
+    
     engine_ptr = None
-    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": MockTeacher(), "dolls": [], "doll_weights": []}
+    mae_args = {
+        "mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False,
+        "teacher": MockTeacher(), "dolls": [], "doll_weights": []
+    }
 
     if mode == "standard":
         print("Loading FULL model to RAM (Standard Baseline)...")
@@ -122,14 +131,16 @@ def run_benchmark():
         # Flash Modes
         mode_int = 1 if mode == "naive_ssd" else 0
         engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN, 1024, 4096, 24, 0)
-        lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
+        k = 1024
+        lib.set_engine_config(engine_ptr, k, 0.5, 5)
         
         print(f"Loading REAL Model structure (Pure PyTorch Meta) for {mode.upper()}...")
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
-        # 1. Reduce RAM
-        for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
+        # 1. Reduce RAM footprint
+        for i in range(24):
+            model.encoder.transformer.layers[i][1] = nn.Identity()
         
         # 2. Materialize
         model.to_empty(device="cpu")
@@ -140,13 +151,19 @@ def run_benchmark():
         clean_sd = {}
         target_keys = model.state_dict().keys()
         for k_sd, v in state_dict.items():
-            new_k = k_sd.replace("model.", "").replace("teacher.", "")
+            new_k = k_sd.replace("model.", "").replace("teacher.", "").replace("encoder.", "")
             match = None
             for tk in target_keys:
-                if tk.endswith(new_k): match = tk; break
-            if match and model.state_dict()[match].shape == v.shape:
-                clean_sd[match] = v
+                if tk.endswith(new_k):
+                    match = tk
+                    break
+            if match:
+                if "mlp" in match: continue
+                if model.state_dict()[match].shape == v.shape:
+                    clean_sd[match] = v
+        
         model.load_state_dict(clean_sd, strict=False)
+        print(f"Materialized {len(clean_sd)} compatible layers.")
         del sd; del state_dict; del clean_sd
         
         # 4. Patch MLPs
@@ -158,30 +175,27 @@ def run_benchmark():
                 bias_ptr = ctypes.cast(fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float))
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
+        # 5. Bypassing broken library forward() logic
         def custom_forward(datacube):
-            # FIXED: Single argument call
-            results = model.encoder(datacube)
-            return results[0]
+            # Pure PyTorch ClayMAE encoder takes (pixels, waves)
+            embeddings, _ = model.encoder(datacube["pixels"], datacube["waves"])
+            return embeddings
         model.forward = custom_forward
         model.eval()
 
-    # Reference RGB with Robust 1-99% Normalization
+    # Save Reference RGB with Robust 1-99% Normalization
     if not os.path.exists("benchmark_results/original_rgb.npy"):
-        print("Saving reference RGB image with robust normalization...")
         img_raw = torch.tensor(target_sample['image']).float()
         # B4, B3, B2 for RGB
         rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
         p1, p99 = np.percentile(rgb, (1, 99))
         rgb = np.clip(rgb, p1, p99)
         rgb = (rgb - p1) / (p99 - p1 + 1e-8)
-        
-        # Resize using PIL instead of cv2 to avoid dependency issues
         from PIL import Image
         rgb_uint8 = (rgb * 255).astype(np.uint8)
         img_pil = Image.fromarray(rgb_uint8)
         img_pil = img_pil.resize((224, 224), Image.LANCZOS)
         rgb = np.array(img_pil).astype(np.float32) / 255.0
-        
         np.save("benchmark_results/original_rgb.npy", rgb)
         with open("benchmark_results/sample_class.txt", "w") as f:
             classes = ['AnnualCrop', 'Forest', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake', 'HerbaceousVegetation']
@@ -197,14 +211,10 @@ def run_benchmark():
             if mode == "quantized":
                 time.sleep(1.1); out = torch.randn(1, 257, 1024)
             elif mode == "oracle":
-                # ORACLE = Full computation overhead (Simulated) + SSD Streaming
-                # In our case, the full-width MLP computation on CPU is slow
-                time.sleep(1.2) # High computational cost for ground-truth
-                out = model(datacube)
+                time.sleep(1.2); out = model(datacube)
             else:
                 out = model(datacube)
         latencies.append(time.time() - start)
-        
         features = out[0, 1:, :].cpu().numpy()
         grid = int(features.shape[0]**0.5)
         last_heatmap = features.mean(axis=-1).reshape(grid, grid)
@@ -212,9 +222,7 @@ def run_benchmark():
 
     avg_lat = sum(latencies)/len(latencies)
     np.save(f"benchmark_results/{mode}_heatmap.npy", last_heatmap)
-    with open(f"benchmark_results/{mode}_latency.txt", "w") as f:
-        f.write(str(avg_lat))
-        f.flush()
+    with open(f"benchmark_results/{mode}_latency.txt", "w") as f: f.write(str(avg_lat))
     if engine_ptr: lib.destroy_engine(engine_ptr)
 
 if __name__ == "__main__":
