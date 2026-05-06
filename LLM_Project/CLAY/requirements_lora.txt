@@ -1,0 +1,21 @@
+# ==========================================
+# EuroSAT LoRA Fine-Tuning Dependencies
+# ==========================================
+
+# 1. Core Deep Learning Framework
+torch
+torchvision
+pytorch-lightning
+
+# 2. Parameter-Efficient Fine-Tuning (PEFT)
+peft
+
+# 3. Data Processing & Utilities
+Pillow
+PyYAML
+tqdm
+
+# 4. Evaluation & Visualization
+matplotlib
+seaborn
+scikit-learn

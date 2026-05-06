@@ -1,0 +1,7 @@
+# Raspberry Pi Inference Dependencies
+torch
+torchvision
+pytorch-lightning
+peft
+Pillow
+PyYAML
