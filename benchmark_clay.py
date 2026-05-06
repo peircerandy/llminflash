@@ -183,12 +183,24 @@ def run_benchmark():
         model.forward = custom_forward
         model.eval()
 
-    # Reference RGB
+    # Reference RGB (Improved for PPT and Satellite Data)
     if not os.path.exists("benchmark_results/original_rgb.npy"):
+        print("Saving reference RGB image with robust normalization...")
         img_raw = torch.tensor(target_sample['image']).float()
-        rgb = img_raw[[2, 1, 0], :, :].cpu().numpy().transpose(1, 2, 0)
-        rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
-        np.save("benchmark_results/original_rgb.npy", rgb)
+        # EuroSAT MSI bands: 3=Red, 2=Green, 1=Blue
+        rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
+        
+        # Robust Satellite Normalization: Clip 2nd and 98th percentiles
+        # This prevents 'black/white strips' from clouds or shadows
+        p2, p98 = np.percentile(rgb, (2, 98))
+        rgb = np.clip(rgb, p2, p98)
+        rgb = (rgb - p2) / (p98 - p2 + 1e-8)
+        
+        # Resize to 224x224 to match model patches [16x16]
+        import cv2
+        rgb_resized = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_CUBIC)
+        
+        np.save("benchmark_results/original_rgb.npy", rgb_resized)
         with open("benchmark_results/sample_class.txt", "w") as f:
             classes = ['AnnualCrop', 'Forest', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake', 'HerbaceousVegetation']
             f.write(classes[target_sample['label']])
