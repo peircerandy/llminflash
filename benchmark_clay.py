@@ -81,7 +81,6 @@ def run_benchmark():
     args_cli = parser.parse_args()
     mode = args_cli.mode
 
-    # 0. Setup Metadata
     metadata_yaml = """sentinel-2-l2a:
   band_order: [blue, green, red, rededge1, rededge2, rededge3, nir, nir08, swir16, swir22]
   rgb_indices: [2, 1, 0]
@@ -96,11 +95,9 @@ def run_benchmark():
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
     dataset = load_dataset("blanchon/EuroSAT_MSI", split="train", streaming=True)
-    
-    # Find identifiable sample
     target_sample = None
     for s in dataset:
-        if s['label'] in [6, 3]: 
+        if s['label'] in [6, 3]: # Residential/Industrial
             target_sample = s
             break
     if not target_sample: target_sample = next(iter(dataset))
@@ -109,21 +106,9 @@ def run_benchmark():
     os.makedirs("benchmark_results", exist_ok=True)
     
     engine_ptr = None
-    mae_args = {
-        "mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False,
-        "teacher": MockTeacher(), "dolls": [], "doll_weights": []
-    }
+    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": MockTeacher(), "dolls": [], "doll_weights": []}
 
-    if mode == "standard":
-        print("Loading FULL model to RAM (Standard Baseline)...")
-        # Standard OOM-risky load
-        model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
-        sd = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
-        state_dict = sd.get("state_dict", sd)
-        clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items() if "teacher." not in k}
-        model.load_state_dict(clean_sd, strict=False)
-        model.eval()
-    elif mode == "quantized":
+    if mode == "quantized":
         pass
     else:
         # Flash Modes
@@ -136,17 +121,13 @@ def run_benchmark():
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
-        # 1. Reduce RAM footprint while on Meta device
-        # Replace MLPs with Identity first so to_empty doesn't allocate 4GB
-        for i in range(24):
-            model.encoder.transformer.layers[i][1] = nn.Identity()
+        # 1. Reduction
+        for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
         
-        # 2. Materialize the remaining lean structure to CPU
-        print("Materializing lean model structure to CPU...")
+        # 2. Materialization
         model.to_empty(device="cpu")
 
-        # 3. Surgically load non-MLP weights
-        print("Loading weights from checkpoint...")
+        # 3. Load weights
         sd = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd.get("state_dict", sd)
         clean_sd = {}
@@ -155,17 +136,12 @@ def run_benchmark():
             new_k = k_sd.replace("model.", "").replace("teacher.", "")
             match = None
             for tk in target_keys:
-                if tk.endswith(new_k):
-                    match = tk
-                    break
+                if tk.endswith(new_k): match = tk; break
             if match and model.state_dict()[match].shape == v.shape:
                 clean_sd[match] = v
-        
         model.load_state_dict(clean_sd, strict=False)
-        print(f"Loaded {len(clean_sd)} compatible layers.")
-        del sd; del state_dict; del clean_sd
         
-        # 4. Patch MLPs back with Flash Engine
+        # 4. Patch
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
                 model.encoder.transformer.layers[i][1] = nn.Identity()
@@ -174,33 +150,23 @@ def run_benchmark():
                 bias_ptr = ctypes.cast(fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float))
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
-        # 5. Bypassing broken library forward() logic
         def custom_forward(datacube):
-            # The encoder expects the entire datacube dictionary
-            results = model.encoder(datacube)
-            # Return the first value (encoded_patches)
-            return results[0]
+            embeddings, _ = model.encoder(datacube["pixels"], datacube["waves"])
+            return embeddings
         model.forward = custom_forward
         model.eval()
 
-    # Reference RGB (Improved for PPT and Satellite Data)
+    # Save Reference RGB with Robust 1-99% Normalization
     if not os.path.exists("benchmark_results/original_rgb.npy"):
-        print("Saving reference RGB image with robust normalization...")
         img_raw = torch.tensor(target_sample['image']).float()
-        # EuroSAT MSI bands: 3=Red, 2=Green, 1=Blue
+        # B4, B3, B2 for RGB
         rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
-        
-        # Robust Satellite Normalization: Clip 2nd and 98th percentiles
-        # This prevents 'black/white strips' from clouds or shadows
-        p2, p98 = np.percentile(rgb, (2, 98))
-        rgb = np.clip(rgb, p2, p98)
-        rgb = (rgb - p2) / (p98 - p2 + 1e-8)
-        
-        # Resize to 224x224 to match model patches [16x16]
+        p1, p99 = np.percentile(rgb, (1, 99))
+        rgb = np.clip(rgb, p1, p99)
+        rgb = (rgb - p1) / (p99 - p1 + 1e-8)
         import cv2
-        rgb_resized = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_CUBIC)
-        
-        np.save("benchmark_results/original_rgb.npy", rgb_resized)
+        rgb = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_CUBIC)
+        np.save("benchmark_results/original_rgb.npy", rgb)
         with open("benchmark_results/sample_class.txt", "w") as f:
             classes = ['AnnualCrop', 'Forest', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake', 'HerbaceousVegetation']
             f.write(classes[target_sample['label']])
@@ -225,7 +191,9 @@ def run_benchmark():
 
     avg_lat = sum(latencies)/len(latencies)
     np.save(f"benchmark_results/{mode}_heatmap.npy", last_heatmap)
-    with open(f"benchmark_results/{mode}_latency.txt", "w") as f: f.write(str(avg_lat))
+    with open(f"benchmark_results/{mode}_latency.txt", "w") as f:
+        f.write(str(avg_lat))
+        f.flush()
     if engine_ptr: lib.destroy_engine(engine_ptr)
 
 if __name__ == "__main__":
