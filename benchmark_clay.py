@@ -174,8 +174,14 @@ def run_benchmark():
         p1, p99 = np.percentile(rgb, (1, 99))
         rgb = np.clip(rgb, p1, p99)
         rgb = (rgb - p1) / (p99 - p1 + 1e-8)
-        import cv2
-        rgb = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_CUBIC)
+        
+        # Resize using PIL instead of cv2 to avoid dependency issues
+        from PIL import Image
+        rgb_uint8 = (rgb * 255).astype(np.uint8)
+        img_pil = Image.fromarray(rgb_uint8)
+        img_pil = img_pil.resize((224, 224), Image.LANCZOS)
+        rgb = np.array(img_pil).astype(np.float32) / 255.0
+        
         np.save("benchmark_results/original_rgb.npy", rgb)
         with open("benchmark_results/sample_class.txt", "w") as f:
             classes = ['AnnualCrop', 'Forest', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake', 'HerbaceousVegetation']
