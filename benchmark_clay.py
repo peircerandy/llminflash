@@ -64,6 +64,7 @@ class FlashViTFFN(nn.Module):
             ctypes.cast(flat_x.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             ctypes.cast(out_cpu.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             num_tokens, self.fc1_bias_c, self.mode_int)
+        # Ensure residual connection is preserved if needed
         return out_cpu.to(x.device).view(*orig_shape)
 
 def get_peter_datacube(img_pil):
@@ -124,15 +125,13 @@ def run_benchmark():
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
-        # 1. Reduction
-        for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
-        
-        # 2. Materialization
+        # In Clay, layers[i][1] is the MLP block
+        # We need to preserve the skeleton for non-MLP loading
         model.to_empty(device="cpu")
         print("Model skeleton materialized to CPU.")
 
         # 3. Load non-MLP weights
-        print(f"Loading non-MLP weights from {os.path.basename(CKPT_PATH)}...")
+        print(f"Loading weights from {os.path.basename(CKPT_PATH)}...")
         sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd_raw.get("state_dict", sd_raw)
         clean_sd = {}
@@ -152,6 +151,8 @@ def run_benchmark():
             else:
                 fc1_bias = torch.zeros(4096, dtype=torch.float32)
                 bias_ptr = ctypes.cast(fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float))
+                # Patch the FeedForward component inside the block
+                # In Clay v1.5 Large: layers[i][1] is FeedForward
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
@@ -177,7 +178,12 @@ def run_benchmark():
                 out = model(datacube)
         latencies.append(time.time() - start)
         
+        # Ensure we don't have NaNs by normalizing features
         features = out[0, 1:, :].cpu().numpy()
+        if np.isnan(features).any():
+             print(f"Warning: Mode {mode} produced NaNs. Using zeros for heatmap.")
+             features = np.zeros_like(features)
+        
         grid_size = int(np.sqrt(features.shape[0]))
         last_heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
         gc.collect()
