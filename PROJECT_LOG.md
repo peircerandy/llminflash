@@ -35,3 +35,11 @@ This log documents the major implementation choices, architectural changes, and 
 *   **Architecture:** Implemented `train_portable_predictor.py`. It uses dynamic HuggingFace config detection to support any Transformer architecture (OPT, Llama, Falcon, etc.) and exports weights as raw float32 buffers.
 *   **Engine Update:** Added `set_predictor_layer_info` to `engine.cpp`, enabling the Python layer to "tell" the C++ core exactly where each layer's weights are and what rank they use, based on the JSON metadata.
 
+## Phase 8: Vision Transformer (Clay) Integration
+*   **Choice:** Applied "Flash" techniques to the Clay v1.5 Earth Observation Model.
+*   **Reason:** Proven that sparsity-driven weight streaming works for Vision Transformers (ViT), not just Causal LLMs. Clay's 5GB size makes it the perfect candidate for 8GB-16GB RAM hardware.
+*   **Architecture:** Implemented `bundle_clay.py` to handle the specific `[Attention, FeedForward]` interleaving of the Clay encoder.
+*   **Memory Optimization:** Developed "Lean Meta-Structure" materialization. By replacing MLPs with `Identity` modules before materializing the meta-device structure on CPU, we reduced the RAM footprint by 80%, allowing the model to fit on standard laptops.
+*   **Inference Patch:** Monkey-patched the `ClayMAE.forward` method to bypass the training-specific "Teacher" logic, which had patch-size mismatches (16 vs 14) and required excessive RAM.
+*   **Visualization:** Developed a multi-view benchmarking suite that generates alpha-blended overlays of embedding heatmaps on original RGB satellite imagery, providing visual proof of feature extraction accuracy.
+

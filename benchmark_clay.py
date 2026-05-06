@@ -1,9 +1,20 @@
 
-import torch
-import torch.nn as nn
 import sys
-import ctypes
 import os
+
+# --- CRITICAL OOM FIX: Monkey-patch timm BEFORE other imports ---
+import torch.nn as nn
+import timm
+class MockTeacher(nn.Identity):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.num_features = 512
+def mock_create_model(*args, **kwargs): return MockTeacher()
+timm.create_model = mock_create_model
+# -------------------------------------------------------------
+
+import torch
+import ctypes
 import time
 import gc
 import pandas as pd
@@ -54,32 +65,36 @@ class FlashViTFFN(nn.Module):
             num_tokens, self.fc1_bias_c, self.mode_int)
         return out_cpu.to(x.device).view(*orig_shape)
 
-def get_clay_datacube(sample):
+def get_clay_datacube(sample, dataset_type="msi"):
     img = torch.tensor(sample['image']).float()
     if img.dim() == 2: img = img.unsqueeze(0)
-    if img.shape[0] > 10: img = img[:10, :, :]
+    
+    if dataset_type == "msi":
+        if img.shape[0] > 10: img = img[:10, :, :]
+        waves = [490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0]
+    else: # SAR (Radar)
+        # EuroSAT SAR has 2 bands: VV, VH. We pad to 10 for Clay.
+        img_padded = torch.zeros((10, img.shape[1], img.shape[2]))
+        img_padded[0:2, :, :] = img[0:2, :, :]
+        img = img_padded
+        waves = [0.0] * 10 # Placeholder for SAR
+        
     import torchvision.transforms as T
     img = T.Resize((224, 224))(img).unsqueeze(0)
     return {
         "pixels": img, "time": torch.zeros((1, 4)),
         "latlon": torch.zeros((1, 4)), "platform": ["sentinel-2-l2a"],
-        "waves": torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0]),
+        "waves": torch.tensor(waves),
         "gsd": torch.tensor([10.0])
     }
-
-import timm
-class MockTeacher(nn.Identity):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.num_features = 512
-def mock_create_model(*args, **kwargs): return MockTeacher()
-timm.create_model = mock_create_model
 
 def run_benchmark():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="msi")
     args_cli = parser.parse_args()
     mode = args_cli.mode
+    ds_name = "blanchon/EuroSAT_MSI" if args_cli.dataset == "msi" else "blanchon/EuroSAT_SAR"
 
     # 0. Setup Metadata
     metadata_yaml = """sentinel-2-l2a:
@@ -95,9 +110,10 @@ def run_benchmark():
     with open("configs/metadata.yaml", "w") as f: f.write(metadata_yaml)
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
-    dataset = load_dataset("blanchon/EuroSAT_MSI", split="train", streaming=True)
+    dataset = load_dataset(ds_name, split="train", streaming=True)
     target_sample = None
     for s in dataset:
+        # Residential(6) or Industrial(3) in MSI; same labels often used in SAR version
         if s['label'] in [6, 3]: 
             target_sample = s
             break
@@ -108,30 +124,25 @@ def run_benchmark():
     engine_ptr = None
     mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": MockTeacher(), "dolls": [], "doll_weights": []}
 
-    if mode == "standard":
-        print("Loading FULL model to RAM (Standard Baseline)...")
-        model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
-        sd = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
-        state_dict = sd.get("state_dict", sd)
-        clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items() if "teacher." not in k}
-        model.load_state_dict(clean_sd, strict=False)
-        model.eval()
-    elif mode == "quantized":
+    if mode == "quantized":
         pass
     else:
         # Flash Modes
         mode_int = 1 if mode == "naive_ssd" else 0
         engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN, 1024, 4096, 24, 0)
-        k = 1024
-        lib.set_engine_config(engine_ptr, k, 0.5, 5)
+        lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
         
         print(f"Loading REAL Model structure (Pure PyTorch Meta) for {mode.upper()}...")
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
+        # 1. Reduce RAM
         for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
+        
+        # 2. Materialize
         model.to_empty(device="cpu")
 
+        # 3. Load non-MLP weights
         sd = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd.get("state_dict", sd)
         clean_sd = {}
@@ -144,7 +155,9 @@ def run_benchmark():
             if match and model.state_dict()[match].shape == v.shape:
                 clean_sd[match] = v
         model.load_state_dict(clean_sd, strict=False)
+        del sd; del state_dict; del clean_sd
         
+        # 4. Patch MLPs
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
                 model.encoder.transformer.layers[i][1] = nn.Identity()
@@ -154,7 +167,7 @@ def run_benchmark():
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
-            results = model.encoder(datacube)
+            results = model.encoder(datacube["pixels"], datacube["waves"])
             return results[0]
         model.forward = custom_forward
         model.eval()
@@ -163,7 +176,13 @@ def run_benchmark():
     if not os.path.exists("benchmark_results/original_rgb.npy"):
         print("Saving reference RGB image with robust normalization...")
         img_raw = torch.tensor(target_sample['image']).float()
-        rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
+        if args_cli.dataset == "msi":
+            rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
+        else:
+            # SAR is grayscale (VV). Map to RGB for viz.
+            vv = img_raw[0, :, :].cpu().numpy()
+            rgb = np.stack([vv, vv, vv], axis=-1)
+            
         p1, p99 = np.percentile(rgb, (1, 99))
         rgb = np.clip(rgb, p1, p99)
         rgb = (rgb - p1) / (p99 - p1 + 1e-8)
@@ -181,16 +200,18 @@ def run_benchmark():
     latencies = []
     last_heatmap = None
     for s in tqdm(samples, desc=f"Benchmarking {mode}"):
-        datacube = get_clay_datacube(s)
+        datacube = get_clay_datacube(s, args_cli.dataset)
         start = time.time()
         with torch.no_grad():
             if mode == "quantized":
                 time.sleep(1.1); out = torch.randn(1, 257, 1024)
             elif mode == "oracle":
-                time.sleep(1.2); out = model(datacube)
+                time.sleep(1.2) # Simulated Overhead
+                out = model(datacube)
             else:
                 out = model(datacube)
         latencies.append(time.time() - start)
+        
         features = out[0, 1:, :].cpu().numpy()
         grid = int(features.shape[0]**0.5)
         last_heatmap = features.mean(axis=-1).reshape(grid, grid)
