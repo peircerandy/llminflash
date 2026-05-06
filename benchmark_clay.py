@@ -66,31 +66,20 @@ class FlashViTFFN(nn.Module):
             num_tokens, self.fc1_bias_c, self.mode_int)
         return out_cpu.to(x.device).view(*orig_shape)
 
-# --- Adopted Peter's Data Preparation Logic ---
 def get_peter_datacube(img_pil):
-    # Match Peter's preprocessing
     preprocess = T.Compose([
         T.Resize((224, 224)),
         T.ToTensor(),
-        # Standard ImageNet Norm (as in Peter's pi_inference.py)
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    tensor_img = preprocess(img_pil).unsqueeze(0) # [1, 3, 224, 224]
-    
-    # Pad with 7 dummy channels
+    tensor_img = preprocess(img_pil).unsqueeze(0)
     padding = torch.zeros((1, 7, 224, 224))
     pixels_10ch = torch.cat([tensor_img, padding], dim=1)
-    
-    # Match Peter's WAVES
     waves = torch.tensor([665.0, 560.0, 490.0, 0, 0, 0, 0, 0, 0, 0])
-    
     return {
-        "pixels": pixels_10ch,
-        "waves": waves,
-        "latlon": torch.zeros((1, 4)),
-        "time": torch.zeros((1, 4)),
-        "gsd": torch.tensor([10.0]),
-        "platform": ["sentinel-2-l2a"]
+        "pixels": pixels_10ch, "waves": waves,
+        "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)),
+        "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]
     }
 
 def run_benchmark():
@@ -99,7 +88,6 @@ def run_benchmark():
     args_cli = parser.parse_args()
     mode = args_cli.mode
 
-    # 0. Setup Metadata
     metadata_yaml = """sentinel-2-l2a:
   band_order: [blue, green, red, rededge1, rededge2, rededge3, nir, nir08, swir16, swir22]
   rgb_indices: [2, 1, 0]
@@ -113,30 +101,18 @@ def run_benchmark():
     with open("configs/metadata.yaml", "w") as f: f.write(metadata_yaml)
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
-    # 1. Adopt Peter's Dataset choice
     print("🌍 Loading EuroSAT RGB Dataset (Torchvision)...")
     dataset = torchvision.datasets.EuroSAT(root="CLAY/data", download=True)
-    
-    target_sample_img = None
-    target_label = None
-    for i in range(len(dataset)):
-        img, lbl = dataset[i]
-        if lbl == 4: # Industrial (Peter's order is different, let's check)
-            # Actually EuroSAT classes: AnnualCrop(0), Forest(1), HerbaceousVegetation(2), Highway(3), Industrial(4)...
-            target_sample_img = img
-            target_label = lbl
-            break
-    if not target_sample_img: target_sample_img, target_label = dataset[0]
+    target_sample_img, target_label = dataset[4] # Industrial
     samples = [target_sample_img] * SAMPLES
     
     os.makedirs("benchmark_results", exist_ok=True)
     engine_ptr = None
-    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": MockTeacher(), "dolls": [], "doll_weights": []}
+    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": "vit_large", "dolls": [], "doll_weights": []}
 
     if mode == "quantized":
         pass
     else:
-        # Flash Modes: 0=Predictor, 1=Naive, 2=Oracle
         if mode == "naive_ssd": mode_int = 1
         elif mode == "oracle": mode_int = 2
         else: mode_int = 0
@@ -148,6 +124,14 @@ def run_benchmark():
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
+        # 1. Reduction
+        for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
+        
+        # 2. Materialization
+        model.to_empty(device="cpu")
+        print("Model skeleton materialized to CPU.")
+
+        # 3. Load non-MLP weights
         print(f"Loading non-MLP weights from {os.path.basename(CKPT_PATH)}...")
         sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd_raw.get("state_dict", sd_raw)
@@ -156,11 +140,11 @@ def run_benchmark():
         for k_ckpt, v in state_dict.items():
             mk = k_ckpt.replace("model.", "")
             if mk in model_state:
+                if "mlp" in mk: continue
                 if model_state[mk].shape == v.shape:
                     clean_sd[mk] = v
-
-        missing, unexpected = model.load_state_dict(clean_sd, strict=False, assign=True)
-        print(f"Materialized and Loaded {len(clean_sd)} compatible layers.")
+        model.load_state_dict(clean_sd, strict=False)
+        print(f"Loaded {len(clean_sd)} compatible layers.")
 
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
@@ -171,29 +155,20 @@ def run_benchmark():
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
-            # Signature check
-            try:
-                results = model.encoder(datacube)
-            except TypeError:
-                results = model.encoder(datacube["pixels"], datacube["waves"])
+            results = model.encoder(datacube)
             return results[0] if isinstance(results, (tuple, list)) else results
         model.forward = custom_forward
         model.eval()
-    # Save Reference RGB for plotting
+
     if not os.path.exists("benchmark_results/original_rgb.npy"):
-        # Save as 224x224 for 1:1 overlay
         img_resized = target_sample_img.resize((224, 224), Image.LANCZOS)
         np.save("benchmark_results/original_rgb.npy", np.array(img_resized).astype(np.float32) / 255.0)
-        with open("benchmark_results/sample_class.txt", "w") as f:
-            f.write("INDUSTRIAL")
+        with open("benchmark_results/sample_class.txt", "w") as f: f.write("INDUSTRIAL")
 
-    # Benchmark loop
     latencies = []
     last_heatmap = None
     for s_img in tqdm(samples, desc=f"Benchmarking {mode}"):
         datacube = get_peter_datacube(s_img)
-        print(f"DEBUG: Input pixels range [{datacube['pixels'].min()}, {datacube['pixels'].max()}] NaN: {torch.isnan(datacube['pixels']).any()}")
-        
         start = time.time()
         with torch.no_grad():
             if mode == "quantized":
@@ -201,8 +176,6 @@ def run_benchmark():
             else:
                 out = model(datacube)
         latencies.append(time.time() - start)
-        
-        print(f"DEBUG: Output mean: {out.mean()} NaN: {torch.isnan(out).any()}")
         
         features = out[0, 1:, :].cpu().numpy()
         grid_size = int(np.sqrt(features.shape[0]))
