@@ -148,24 +148,19 @@ def run_benchmark():
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
         
-        # Reduction and Materialization
-        for i in range(24): model.encoder.transformer.layers[i][1] = nn.Identity()
-        model.to_empty(device="cpu")
-
         print(f"Loading non-MLP weights from {os.path.basename(CKPT_PATH)}...")
         sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd_raw.get("state_dict", sd_raw)
         clean_sd = {}
         model_state = model.state_dict()
         for k_ckpt, v in state_dict.items():
-            # Simply strip the 'model.' prefix
             mk = k_ckpt.replace("model.", "")
             if mk in model_state:
                 if model_state[mk].shape == v.shape:
                     clean_sd[mk] = v
 
-        missing, unexpected = model.load_state_dict(clean_sd, strict=False)
-        print(f"Loaded {len(clean_sd)} layers. Missing: {len(missing)} (includes MLPs)")
+        missing, unexpected = model.load_state_dict(clean_sd, strict=False, assign=True)
+        print(f"Materialized and Loaded {len(clean_sd)} compatible layers.")
 
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
@@ -181,7 +176,7 @@ def run_benchmark():
                 results = model.encoder(datacube)
             except TypeError:
                 results = model.encoder(datacube["pixels"], datacube["waves"])
-            return results[0] 
+            return results[0] if isinstance(results, (tuple, list)) else results
         model.forward = custom_forward
         model.eval()
     # Save Reference RGB for plotting
@@ -197,6 +192,8 @@ def run_benchmark():
     last_heatmap = None
     for s_img in tqdm(samples, desc=f"Benchmarking {mode}"):
         datacube = get_peter_datacube(s_img)
+        print(f"DEBUG: Input pixels range [{datacube['pixels'].min()}, {datacube['pixels'].max()}] NaN: {torch.isnan(datacube['pixels']).any()}")
+        
         start = time.time()
         with torch.no_grad():
             if mode == "quantized":
@@ -204,6 +201,8 @@ def run_benchmark():
             else:
                 out = model(datacube)
         latencies.append(time.time() - start)
+        
+        print(f"DEBUG: Output mean: {out.mean()} NaN: {torch.isnan(out).any()}")
         
         features = out[0, 1:, :].cpu().numpy()
         grid_size = int(np.sqrt(features.shape[0]))
