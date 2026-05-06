@@ -17,7 +17,9 @@ import ctypes
 import time
 import gc
 import pandas as pd
-from datasets import load_dataset
+import torchvision
+import torchvision.transforms as T
+from PIL import Image
 from tqdm import tqdm
 import warnings
 import numpy as np
@@ -64,17 +66,31 @@ class FlashViTFFN(nn.Module):
             num_tokens, self.fc1_bias_c, self.mode_int)
         return out_cpu.to(x.device).view(*orig_shape)
 
-def get_clay_datacube(sample):
-    img = torch.tensor(sample['image']).float()
-    if img.dim() == 2: img = img.unsqueeze(0)
-    if img.shape[0] > 10: img = img[:10, :, :]
-    import torchvision.transforms as T
-    img = T.Resize((224, 224))(img).unsqueeze(0)
+# --- Adopted Peter's Data Preparation Logic ---
+def get_peter_datacube(img_pil):
+    # Match Peter's preprocessing
+    preprocess = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        # Standard ImageNet Norm (as in Peter's pi_inference.py)
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    tensor_img = preprocess(img_pil).unsqueeze(0) # [1, 3, 224, 224]
+    
+    # Pad with 7 dummy channels
+    padding = torch.zeros((1, 7, 224, 224))
+    pixels_10ch = torch.cat([tensor_img, padding], dim=1)
+    
+    # Match Peter's WAVES
+    waves = torch.tensor([665.0, 560.0, 490.0, 0, 0, 0, 0, 0, 0, 0])
+    
     return {
-        "pixels": img, "time": torch.zeros((1, 4)),
-        "latlon": torch.zeros((1, 4)), "platform": ["sentinel-2-l2a"],
-        "waves": torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0]),
-        "gsd": torch.tensor([10.0])
+        "pixels": pixels_10ch,
+        "waves": waves,
+        "latlon": torch.zeros((1, 4)),
+        "time": torch.zeros((1, 4)),
+        "gsd": torch.tensor([10.0]),
+        "platform": ["sentinel-2-l2a"]
     }
 
 def run_benchmark():
@@ -83,6 +99,7 @@ def run_benchmark():
     args_cli = parser.parse_args()
     mode = args_cli.mode
 
+    # 0. Setup Metadata
     metadata_yaml = """sentinel-2-l2a:
   band_order: [blue, green, red, rededge1, rededge2, rededge3, nir, nir08, swir16, swir22]
   rgb_indices: [2, 1, 0]
@@ -96,28 +113,30 @@ def run_benchmark():
     with open("configs/metadata.yaml", "w") as f: f.write(metadata_yaml)
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
-    dataset = load_dataset("blanchon/EuroSAT_MSI", split="train", streaming=True)
-    target_sample = None
-    for s in dataset:
-        if s['label'] in [3]: # Industrial
-            target_sample = s
+    # 1. Adopt Peter's Dataset choice
+    print("🌍 Loading EuroSAT RGB Dataset (Torchvision)...")
+    dataset = torchvision.datasets.EuroSAT(root="CLAY/data", download=True)
+    
+    target_sample_img = None
+    target_label = None
+    for i in range(len(dataset)):
+        img, lbl = dataset[i]
+        if lbl == 4: # Industrial (Peter's order is different, let's check)
+            # Actually EuroSAT classes: AnnualCrop(0), Forest(1), HerbaceousVegetation(2), Highway(3), Industrial(4)...
+            target_sample_img = img
+            target_label = lbl
             break
-    if not target_sample: target_sample = next(iter(dataset))
-    samples = [target_sample] * SAMPLES
+    if not target_sample_img: target_sample_img, target_label = dataset[0]
+    samples = [target_sample_img] * SAMPLES
     
     os.makedirs("benchmark_results", exist_ok=True)
-    
     engine_ptr = None
-    # Fix MAE args for library compatibility
-    mae_args = {
-        "mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, 
-        "teacher": MockTeacher(), "dolls": [], "doll_weights": []
-    }
+    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": MockTeacher(), "dolls": [], "doll_weights": []}
 
     if mode == "quantized":
         pass
     else:
-        # Flash Modes: 0=Predictor, 1=Naive, 2=Oracle (Implemented in C++)
+        # Flash Modes: 0=Predictor, 1=Naive, 2=Oracle
         if mode == "naive_ssd": mode_int = 1
         elif mode == "oracle": mode_int = 2
         else: mode_int = 0
@@ -140,20 +159,15 @@ def run_benchmark():
         clean_sd = {}
         model_keys = model.state_dict().keys()
         for k_ckpt, v in state_dict.items():
-            # Robust mapping: Match by suffix to ignore 'model.', 'encoder.' prefixes
             suffix = k_ckpt.split('.')[-2:] if '.' in k_ckpt else [k_ckpt]
             suffix_str = '.'.join(suffix)
-            
             match = None
             for mk in model_keys:
                 if mk.endswith(suffix_str) and model.state_dict()[mk].shape == v.shape:
-                    match = mk
-                    break
-            if match:
-                clean_sd[match] = v
+                    match = mk; break
+            if match: clean_sd[match] = v
         
-        missing, unexpected = model.load_state_dict(clean_sd, strict=False)
-        print(f"Loaded {len(clean_sd)} layers. Missing: {len(missing)} (expected for MLPs)")
+        model.load_state_dict(clean_sd, strict=False)
         
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
@@ -164,35 +178,25 @@ def run_benchmark():
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
-            # Pass only required args to encoder
-            embeddings, _ = model.encoder(datacube["pixels"], datacube["waves"])
-            return embeddings
+            # Pass only the datacube dictionary
+            results = model.encoder(datacube)
+            return results[0] # embeddings
         model.forward = custom_forward
         model.eval()
 
-    # Reference RGB with Robust Normalization
+    # Save Reference RGB for plotting
     if not os.path.exists("benchmark_results/original_rgb.npy"):
-        print("Saving reference RGB image with professional normalization...")
-        img_raw = torch.tensor(target_sample['image']).float()
-        # Sentinel-2 RGB: B4(3), B3(2), B2(1)
-        rgb = img_raw[[3, 2, 1], :, :].cpu().numpy().transpose(1, 2, 0)
-        # Robust 2-98 percentile normalization for satellite data
-        p2, p98 = np.percentile(rgb, (2, 98))
-        rgb = np.clip(rgb, p2, p98)
-        rgb = (rgb - p2) / (p98 - p2 + 1e-8)
-        # Standardize to 224x224
-        from PIL import Image
-        rgb_uint8 = (rgb * 255).astype(np.uint8)
-        img_pil = Image.fromarray(rgb_uint8).resize((224, 224), Image.LANCZOS)
-        np.save("benchmark_results/original_rgb.npy", np.array(img_pil).astype(np.float32) / 255.0)
+        # Save as 224x224 for 1:1 overlay
+        img_resized = target_sample_img.resize((224, 224), Image.LANCZOS)
+        np.save("benchmark_results/original_rgb.npy", np.array(img_resized).astype(np.float32) / 255.0)
         with open("benchmark_results/sample_class.txt", "w") as f:
             f.write("INDUSTRIAL")
 
     # Benchmark loop
     latencies = []
     last_heatmap = None
-    for s in tqdm(samples, desc=f"Benchmarking {mode}"):
-        datacube = get_clay_datacube(s)
+    for s_img in tqdm(samples, desc=f"Benchmarking {mode}"):
+        datacube = get_peter_datacube(s_img)
         start = time.time()
         with torch.no_grad():
             if mode == "quantized":
@@ -201,18 +205,15 @@ def run_benchmark():
                 out = model(datacube)
         latencies.append(time.time() - start)
         
-        # Grid logic: Dynamically determine grid size
         features = out[0, 1:, :].cpu().numpy()
-        num_patches = features.shape[0]
-        grid_size = int(np.sqrt(num_patches))
+        grid_size = int(np.sqrt(features.shape[0]))
         last_heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
         gc.collect()
 
     avg_lat = sum(latencies)/len(latencies)
     np.save(f"benchmark_results/{mode}_heatmap.npy", last_heatmap)
     with open(f"benchmark_results/{mode}_latency.txt", "w") as f:
-        f.write(str(avg_lat))
-        f.flush()
+        f.write(str(avg_lat)); f.flush()
     if engine_ptr: lib.destroy_engine(engine_ptr)
 
 if __name__ == "__main__":
