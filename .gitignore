@@ -1,4 +1,6 @@
-# Python
+# ==========================================
+# Standard Python Environment
+# ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -24,21 +26,47 @@ wheels/
 venv/
 ENV/
 
-# C++
+# ==========================================
+# Standard C++ Environment
+# ==========================================
 *.o
 *.so
 *.a
 *.out
 flash_engine
 
-# OS
+# ==========================================
+# OS Generated Files
+# ==========================================
 .DS_Store
 Thumbs.db
 
-# Project Specific
+# ==========================================
+# Teammate's Project Specific
+# ==========================================
 speed_test copy.py
 *.bin
 *.csv
 *.png
 # Ignore heavy model data/cache if stored locally
 /mnt/wsl/
+
+# ==========================================
+# LLM_Project & CLAY Specific
+# ==========================================
+# Ignore Python Virtual Environment
+LLM_Project/llm_env/
+
+# Ignore large datasets
+LLM_Project/CLAY/data/
+
+# Strictly forbid uploading large model weights (Checkpoints)
+*.ckpt
+*.safetensors
+
+# Ignore fine-tuned LoRA weights and classifier heads
+LLM_Project/CLAY/saved_lora_best/
+
+# Ignore output pictures but keep the directory structure
+LLM_Project/CLAY/outputs/*
+!LLM_Project/CLAY/outputs/.gitkeep

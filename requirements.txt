@@ -5,3 +5,8 @@ accelerate
 matplotlib
 tqdm
 bitsandbytes
+torchvision
+peft
+git+https://github.com/Clay-foundation/model.git
+seaborn
+scikit-learn
