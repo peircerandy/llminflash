@@ -46,27 +46,36 @@ python CLAY/test_inference.py
 
 Follow these steps to run the model on a Raspberry Pi CPU.
 
-### Step 1: Environment Setup
+### 1. File Transfer
+Ensure the following files are in the same folder on your Pi:
+
+- `pi_inference.py`
+- `requirements_pi.txt`
+- `configs/metadata.yaml`
+- `clay-v1.5.ckpt` (Base weights)
+- `saved_lora_best/` (Fine-tuned weights)
+
+### Step 2: Environment Setup
 Install lightweight libraries required for CPU inference:
 
 ```bash
 pip install -r requirements_pi.txt
 ```
 
-### Step 2: Select an Image to Test
+### Step 3: Select an Image to Test
 Because `pi_inference.py` is designed for one image at a time, you must manually tell the script which file to look at:
 
-1. Prepare your image: Place your target image (e.g., test_image.jpg) in the same folder as the script.
-2. Open pi_inference.py: Open the file in a text editor (like nano or VS Code).
-3. Scroll to the bottom: Find the `if __name__ == "__main__":` block.
-4. Modify the filename:
+1. **Prepare your image**: Place your target image (e.g., test_image.jpg) in the same folder as the script.
+2. **Open pi_inference.py**: Open the file in a text editor (like nano or VS Code).
+3. **Scroll to the bottom**: Find the `if __name__ == "__main__":` block.
+4. **Modify the filename**:
 
 ```bash
 # EDIT THIS LINE with your actual filename!
 test_photo = "test_image.jpg"
 ```
 
-### Step 3: Execute
+### Step 4: Execute
 Run single-image inference in terminal:
 
 ```bash
