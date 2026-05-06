@@ -155,20 +155,18 @@ def run_benchmark():
         print(f"Loading non-MLP weights from {os.path.basename(CKPT_PATH)}...")
         sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd_raw.get("state_dict", sd_raw)
-        
         clean_sd = {}
-        model_keys = model.state_dict().keys()
+        model_state = model.state_dict()
         for k_ckpt, v in state_dict.items():
-            suffix = k_ckpt.split('.')[-2:] if '.' in k_ckpt else [k_ckpt]
-            suffix_str = '.'.join(suffix)
-            match = None
-            for mk in model_keys:
-                if mk.endswith(suffix_str) and model.state_dict()[mk].shape == v.shape:
-                    match = mk; break
-            if match: clean_sd[match] = v
-        
-        model.load_state_dict(clean_sd, strict=False)
-        
+            # Simply strip the 'model.' prefix
+            mk = k_ckpt.replace("model.", "")
+            if mk in model_state:
+                if model_state[mk].shape == v.shape:
+                    clean_sd[mk] = v
+
+        missing, unexpected = model.load_state_dict(clean_sd, strict=False)
+        print(f"Loaded {len(clean_sd)} layers. Missing: {len(missing)} (includes MLPs)")
+
         for i in range(24):
             if mode == "draft" and i % 4 == 0:
                 model.encoder.transformer.layers[i][1] = nn.Identity()
@@ -178,12 +176,14 @@ def run_benchmark():
                 model.encoder.transformer.layers[i][1] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
 
         def custom_forward(datacube):
-            # Pass only the datacube dictionary
-            results = model.encoder(datacube)
-            return results[0] # embeddings
+            # Signature check
+            try:
+                results = model.encoder(datacube)
+            except TypeError:
+                results = model.encoder(datacube["pixels"], datacube["waves"])
+            return results[0] 
         model.forward = custom_forward
         model.eval()
-
     # Save Reference RGB for plotting
     if not os.path.exists("benchmark_results/original_rgb.npy"):
         # Save as 224x224 for 1:1 overlay
