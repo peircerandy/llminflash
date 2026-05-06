@@ -1,7 +1,17 @@
-# Raspberry Pi Inference Dependencies
+# Force pip to download lightweight CPU-only versions
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# 1. Core Inference Framework (Lightweight CPU Version)
 torch
 torchvision
 pytorch-lightning
+
+# 2. LoRA Fine-Tuning Weights Loader
 peft
+
+# 3. Image & Configuration Processing
 Pillow
 PyYAML
+
+# 4. Official CLAY Model Architecture (Install directly from GitHub)
+git+https://github.com/Clay-foundation/model.git
