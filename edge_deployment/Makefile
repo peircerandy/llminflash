@@ -8,9 +8,12 @@ ARCH := $(shell uname -m)
 
 ifeq ($(ARCH), x86_64)
     CXXFLAGS += -march=native
-else ifneq (,$(filter $(ARCH), aarch64 arm64 armv7l))
-    # ARM-specific optimizations (Pi 4 / Phone)
-    CXXFLAGS += -march=armv8-a+simd -mfpu=neon-fp-armv8
+else ifneq (,$(filter $(ARCH), aarch64 arm64))
+    # 64-bit ARM (Pi 4 / modern phones) - SIMD/Neon is mandatory
+    CXXFLAGS += -march=armv8-a+simd
+else ifeq ($(ARCH), armv7l)
+    # 32-bit ARM (older Pi)
+    CXXFLAGS += -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard
 endif
 
 all: libengine.so
