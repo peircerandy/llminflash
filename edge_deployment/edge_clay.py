@@ -102,7 +102,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, default="sample_satellite.png", help="Path to input image")
-    parser.add_argument("--mode", type=str, choices=["predictor", "draft"], default="predictor", help="Flash mode")
+    parser.add_argument("--mode", type=str, choices=["predictor", "draft", "dense"], default="predictor", help="Flash mode or Dense baseline")
     args = parser.parse_args()
 
     print(f"--- Clay v1.5 Edge Inference: {args.mode.upper()} MODE ---", flush=True)
@@ -120,46 +120,52 @@ def main():
     with open("configs/metadata.yaml", "w") as f: f.write(metadata_yaml)
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
-    engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN if os.path.exists(PRED_BIN) else b"", 1024, 4096, 24, 0)
-    lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
+    if args.mode != "dense":
+        engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN if os.path.exists(PRED_BIN) else b"", 1024, 4096, 24, 0)
+        lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
 
-    print("Materializing lean model...", flush=True)
+    print("Materializing model structure...", flush=True)
     mae_args = {"mask_ratio": 0.0, "norm_pix_loss": False, "shuffle": False, "teacher": "vit_large_patch16_224", "dolls": [], "doll_weights": []}
-    with init_empty_weights():
+    
+    if args.mode == "dense":
+        print("⚠️ WARNING: Dense mode will attempt to load 5GB into RAM. This may crash your Pi!")
         model = clay_mae_large(metadata=metadata_obj, patch_size=8, decoder_embed_dim=1024, **mae_args)
-    model.to_empty(device="cpu")
+    else:
+        with init_empty_weights():
+            model = clay_mae_large(metadata=metadata_obj, patch_size=8, decoder_embed_dim=1024, **mae_args)
+        model.to_empty(device="cpu")
+    
     print("✅ Model structure materialized.", flush=True)
 
     print("Loading resident weights (mmap)...", flush=True)
     sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
     state_dict = sd_raw.get("state_dict", sd_raw)
-    clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items() if "decoder" not in k and "proj" not in k}
+    
+    if args.mode == "dense":
+        # Load EVERYTHING for dense baseline
+        clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items()}
+    else:
+        # Skip FFNs for Flash modes
+        clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items() if "decoder" not in k and "proj" not in k and "mlp" not in k}
     
     print("Applying weights to model...", flush=True)
     model.load_state_dict(clean_sd, strict=False)
     del sd_raw
-    if "state_dict" in locals(): del state_dict
     import gc
     gc.collect()
-    print("✅ Resident weights loaded.", flush=True)
+    print("✅ Weights loaded.", flush=True)
 
-    print("Zero-initializing remaining parameters...", flush=True)
-    for name, p in model.named_parameters():
-        if name not in clean_sd:
-            with torch.no_grad(): p.zero_()
-    del clean_sd
-    gc.collect()
-
-    print(f"Patching FlashFFN ({args.mode.upper()})...", flush=True)
-    for i in range(24):
-        if i % 4 == 0: print(f"  -> Applying Flash Logic: Layer {i}/24", flush=True)
-        ff_block = model.encoder.transformer.layers[i][1]
-        fc1_bias = torch.zeros(4096, dtype=torch.float32)
-        if args.mode == "draft" and i % 4 == 0:
-            ff_block.net[1], ff_block.net[2], ff_block.net[3] = nn.Identity(), nn.Identity(), nn.Identity()
-        else:
-            ff_block.net[1], ff_block.net[2] = nn.Identity(), nn.Identity()
-            ff_block.net[3] = FlashViTFFN(i, engine_ptr, 1024, 0, fc1_bias)
+    if args.mode != "dense":
+        print(f"Patching FlashFFN ({args.mode.upper()})...", flush=True)
+        for i in range(24):
+            if i % 4 == 0: print(f"  -> Applying Flash Logic: Layer {i}/24", flush=True)
+            ff_block = model.encoder.transformer.layers[i][1]
+            fc1_bias = torch.zeros(4096, dtype=torch.float32)
+            if args.mode == "draft" and i % 4 == 0:
+                ff_block.net[1], ff_block.net[2], ff_block.net[3] = nn.Identity(), nn.Identity(), nn.Identity()
+            else:
+                ff_block.net[1], ff_block.net[2] = nn.Identity(), nn.Identity()
+                ff_block.net[3] = FlashViTFFN(i, engine_ptr, 1024, 0, fc1_bias)
 
     def custom_forward(datacube):
         results = model.encoder(datacube)
@@ -174,7 +180,7 @@ def main():
     latencies = []
     datacube = get_real_datacube(args.image)
     for i in range(5):
-        print(f"  [Pass {i+1}/5] Processing model layers via SSD streaming...", flush=True)
+        print(f"  [Pass {i+1}/5] Processing model layers...", flush=True)
         start = time.time()
         with torch.no_grad(): out = model(datacube)
         latencies.append(time.time() - start)
@@ -190,12 +196,25 @@ def main():
     cls_token = out[0, 0, :].cpu().numpy()
     np.save("edge_output_cls_token.npy", cls_token)
     
+    # Size calculation for presentation
+    input_size = os.path.getsize(args.image) if os.path.exists(args.image) else 0
+    heatmap_size = heatmap.nbytes
+    reduction = input_size / heatmap_size if heatmap_size > 0 else 0
+
     import json
-    metrics = {"device": os.uname().machine, "mode": args.mode, "avg_latency": avg_lat, "timestamp": time.ctime()}
-    with open("edge_metrics.json", "w") as f: json.dump(metrics, f, indent=4)
+    metrics = {
+        "device": os.uname().machine,
+        "mode": args.mode,
+        "avg_latency": avg_lat,
+        "input_img_kb": input_size / 1024,
+        "telemetry_kb": (heatmap.nbytes + cls_token.nbytes) / 1024,
+        "data_reduction_ratio": reduction,
+        "timestamp": time.ctime()
+    }
+    with open(f"edge_metrics_{args.mode}.json", "w") as f: json.dump(metrics, f, indent=4)
     
-    print(f"✅ Success! Latency: {avg_lat:.2f}s. Telemetry saved.")
-    lib.destroy_engine(engine_ptr)
+    print(f"✅ Success! Latency: {avg_lat:.2f}s. Data Reduction: {reduction:.1f}x")
+    if args.mode != "dense": lib.destroy_engine(engine_ptr)
 
 if __name__ == "__main__":
     main()

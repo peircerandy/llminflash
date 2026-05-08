@@ -52,16 +52,33 @@ Copy these from your main workstation using `scp` or `rsync`:
 
 ### 4. Running Edge Inference
 
-**Test Clay Vision Transformer:**
+You can run individual tests or the full automated suite.
+
+**Run Automated Suite:**
 ```bash
-# Run Predictor mode (Default)
-python edge_clay.py --image sample_satellite.png
+bash edge_benchmark.sh
+```
 
-# Run Draft mode (Block Skipping)
-python edge_clay.py --mode draft --image sample_satellite.png
+**Individual Modes:**
+```bash
+# Predictor (Standard LLM-in-a-Flash)
+python edge_clay.py --mode predictor
 
-# Run with your own camera photo
-python edge_clay.py --image my_photo.jpg
+# Dense (Standard PyTorch - WARNING: Requires Swap)
+python edge_clay.py --mode dense
+```
+
+### 🧠 Managing Memory (Swap)
+If **Dense Mode** crashes your Pi immediately, you may need to increase your Swap memory so the OS can "offload" the 5GB model to disk (this proves why our method is faster!).
+
+```bash
+# 1. Stop swap
+sudo dphys-swapfile swapoff
+# 2. Edit /etc/dphys-swapfile and set CONF_SWAPSIZE=4096
+sudo nano /etc/dphys-swapfile
+# 3. Re-init and start
+sudo dphys-swapfile setup
+sudo dphys-swapfile swapon
 ```
 
 ### 📸 Using the Raspberry Pi Camera
