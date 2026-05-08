@@ -24,10 +24,17 @@ An implementation of the "LLM in a Flash: Efficient Out-of-Memory Inference" res
 *   **`performance_llama.png`**: Demonstrates how Llama-3 8B bypasses the "Memory Wall" (8GB OOM) using SSD streaming.
 *   **`performance_clay_radar.png`**: Performance projections for the Clay v1.5 model.
 *   **`accuracy_comparison.png`**: Shows why Sparse Prediction is superior to INT4 Quantization for retaining factual coherence.
-
 ## 🛠 Architecture
 
+### The "Memory Wall" & Edge Performance
+This project was specifically designed to bypass the memory limitations of edge hardware. 
+*   **Traditional Approach:** A standard PyTorch implementation of the Clay v1.5 model (5GB) requires ~8GB of free RAM to load and run inference. On a Raspberry Pi 4B (8GB) or a mobile phone, this often triggers an OOM (Out of Memory) crash before the first prediction is even made.
+*   **Flash Engine Approach:** By offloading the heavy Feed-Forward (FFN) weights to SSD and using a **Low-Rank Predictor**, we reduce the active RAM footprint by **~80%**. 
+*   **Result:** You can run full-precision foundation models on hardware where they previously could not even be loaded.
+
 ### C++ Engine (`engine.cpp`)
+...
+
 A high-performance backend responsible for:
 - Efficient memory-mapped I/O for weight loading.
 - Parallelized FFN execution using OpenMP.

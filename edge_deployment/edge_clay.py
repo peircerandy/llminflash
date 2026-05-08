@@ -72,7 +72,35 @@ def get_dummy_datacube():
         "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]
     }
 
+def get_real_datacube(img_path):
+    if not os.path.exists(img_path):
+        print(f"Warning: {img_path} not found, using random noise.")
+        return get_dummy_datacube()
+        
+    img_pil = Image.open(img_path).convert("RGB")
+    preprocess = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    tensor_img = preprocess(img_pil).unsqueeze(0) # [1, 3, 224, 224] -> RGB
+    # REORDER RGB -> BGR to match Clay/S2 default order: [blue, green, red, ...]
+    bgr_img = tensor_img[:, [2, 1, 0], :, :]
+    padding = torch.zeros((1, 7, 224, 224))
+    pixels_10ch = torch.cat([bgr_img, padding], dim=1)
+    waves = torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0])
+    return {
+        "pixels": pixels_10ch, "waves": waves,
+        "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)),
+        "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]
+    }
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", type=str, default="sample_satellite.png", help="Path to input image (Satellite or Camera photo)")
+    args = parser.parse_args()
+
     print("--- Clay v1.5 Edge Inference Test ---")
     if not os.path.exists(CKPT_PATH):
         print(f"Error: Missing {CKPT_PATH}. Please copy or symlink it here.")
@@ -133,20 +161,28 @@ def main():
     model.eval()
 
     print("Running warmup pass...")
-    datacube = get_dummy_datacube()
     with torch.no_grad():
-        out = model(datacube)
+        out = model(get_dummy_datacube())
 
-    print("Benchmarking Predictor latency on Edge...")
+    print(f"Benchmarking Predictor latency on Edge using: {args.image}")
     latencies = []
+    datacube = get_real_datacube(args.image)
+    
     for _ in range(5):
-        datacube = get_dummy_datacube()
         start = time.time()
         with torch.no_grad():
             out = model(datacube)
         latencies.append(time.time() - start)
     
     print(f"Average Latency (5 runs): {sum(latencies)/len(latencies):.2f} seconds")
+    
+    # Save the result as a tiny heatmap for telemetry
+    features = out[0, 1:, :].cpu().numpy()
+    grid_size = int(np.sqrt(features.shape[0]))
+    heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
+    np.save("edge_output_heatmap.npy", heatmap)
+    print(f"Successfully saved 2D heatmap to 'edge_output_heatmap.npy' ({heatmap.nbytes/1024:.1f} KB)")
+    
     lib.destroy_engine(engine_ptr)
 
 if __name__ == "__main__":

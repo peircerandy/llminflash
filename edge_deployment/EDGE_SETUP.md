@@ -32,9 +32,25 @@ Place them in the same directory as the scripts, or update the paths in the scri
 
 **Test Clay Vision Transformer:**
 ```bash
+# Run with the included satellite sample
 python edge_clay.py
+
+# Run with your own camera photo
+python edge_clay.py --image my_photo.jpg
 ```
-This script initializes the Clay model using lean materialization and the Flash Engine in `predictor` mode. It runs a few forward passes with a dummy datacube to benchmark latency.
+
+### 📸 Using the Raspberry Pi Camera
+You can pipe a fresh photo directly from the Pi Camera into the model:
+
+1. **Capture a photo:**
+   ```bash
+   libcamera-still -o test_capture.jpg
+   ```
+2. **Run inference:**
+   ```bash
+   python edge_clay.py --image test_capture.jpg
+   ```
+*Note: Since Clay is an Earth Observation model, expect "creative" classifications for ground-level objects! Use the generated `edge_output_heatmap.npy` to see what parts of your photo the AI thinks are important features.*
 
 **Test Causal LLM:**
 ```bash

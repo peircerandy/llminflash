@@ -52,7 +52,7 @@ class FlashViTFFN(nn.Module):
         self.engine_ptr = engine_ptr
         self.hidden_size = hidden_size
         self.mode_int = mode_int
-        self.fc1_bias = fc1_bias # Strong reference
+        self.fc1_bias = fc1_bias 
         self.fc1_bias_c = ctypes.cast(self.fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float))
 
     def forward(self, x):
@@ -72,7 +72,7 @@ def get_peter_datacube(img_pil):
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    tensor_img = preprocess(img_pil).unsqueeze(0) # [1, 3, 224, 224] -> RGB
+    tensor_img = preprocess(img_pil).unsqueeze(0) 
     bgr_img = tensor_img[:, [2, 1, 0], :, :]
     padding = torch.zeros((1, 7, 224, 224))
     pixels_10ch = torch.cat([bgr_img, padding], dim=1)
@@ -128,10 +128,13 @@ def run_benchmark():
         engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN, 1024, 4096, 24, 0)
         lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
         
+        print(f"[{mode.upper()}] Materializing Model Structure...", flush=True)
         with init_empty_weights():
             model = clay_mae_large(metadata=metadata_obj, patch_size=8, decoder_embed_dim=1024, **mae_args)
         model.to_empty(device="cpu")
+        print(f"[{mode.upper()}] Model materialized to CPU.", flush=True)
 
+        print(f"[{mode.upper()}] Loading weights from {os.path.basename(CKPT_PATH)} (mmap)...", flush=True)
         sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd_raw.get("state_dict", sd_raw)
         clean_sd = {}
@@ -139,11 +142,19 @@ def run_benchmark():
             mk = k_ckpt.replace("model.", "")
             if "decoder" in mk or "proj" in mk: continue
             clean_sd[mk] = v
+        
+        del sd_raw
+        if "state_dict" in locals(): del state_dict
+        gc.collect()
+
         model.load_state_dict(clean_sd, strict=False)
         
         for name, p in model.named_parameters():
             if name not in clean_sd:
                 with torch.no_grad(): p.zero_()
+        
+        del clean_sd
+        gc.collect()
 
         for i in range(24):
             ff_block = model.encoder.transformer.layers[i][1]
@@ -163,24 +174,7 @@ def run_benchmark():
         model.forward = custom_forward
         model.eval()
 
-    # --- STEP 0: PROTOTYPE BUILDING ---
     proto_path = "benchmark_results/class_prototypes.pt"
-    if not os.path.exists(proto_path) and mode == "naive_ssd":
-        print("🔨 Computing Centroids using Dense Model (Zero-Shot Setup)...")
-        protos = torch.zeros(10, 1024)
-        counts = torch.zeros(10)
-        np.random.seed(99)
-        proto_indices = np.random.choice(len(dataset), 100, replace=False)
-        for idx in tqdm(proto_indices, desc="Building Prototypes"):
-            img, label = dataset[idx]
-            with torch.no_grad():
-                out = model(get_peter_datacube(img))
-                protos[label] += out[0, 0, :].cpu()
-                counts[label] += 1
-        for i in range(10): 
-            if counts[i] > 0: protos[i] /= counts[i]
-        torch.save(protos, proto_path)
-    
     centroids = None
     if os.path.exists(proto_path):
         centroids = torch.load(proto_path)
@@ -206,7 +200,8 @@ def run_benchmark():
     confidences = []
     ground_truth = []
     
-    for s_img, s_label in tqdm(samples, desc=f"Benchmarking {mode}"):
+    for i, (s_img, s_label) in enumerate(samples):
+        print(f"[{mode.upper()}] Processing Sample {i+1}/{SAMPLES}...", flush=True)
         datacube = get_peter_datacube(s_img)
         start = time.time()
         with torch.no_grad():
@@ -220,7 +215,7 @@ def run_benchmark():
         emb = out[0, 0, :].cpu()
         if centroids is not None:
             sims = torch.nn.functional.cosine_similarity(emb.unsqueeze(0), centroids)
-            probs = torch.softmax(sims * 15, dim=0) # Scale for sharper confidence
+            probs = torch.softmax(sims * 15, dim=0) 
             conf, pred = torch.max(probs, dim=0)
             predictions.append(pred.item())
             confidences.append(conf.item())
