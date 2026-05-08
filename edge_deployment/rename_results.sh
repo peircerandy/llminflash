@@ -12,10 +12,12 @@ if [ -z "$DEVICE" ]; then
     exit 1
 fi
 
-echo "Renaming output files with prefix: $DEVICE..."
+echo "Renaming result files with prefix: $DEVICE..."
 
-for f in edge_*; do
+# Target only specific result extensions to protect .sh and .py scripts
+for f in edge_metrics_*.json edge_output_*.npy; do
     if [ -e "$f" ]; then
+        # Rename "edge_metrics_predictor.json" -> "pi4_metrics_predictor.json"
         NEW_NAME="${DEVICE}_${f#edge_}"
         mv "$f" "$NEW_NAME"
         echo "  -> $f  =>  $NEW_NAME"
