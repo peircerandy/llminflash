@@ -98,7 +98,7 @@ def run_viz():
     plt.savefig("benchmark_visual_comparison.png", dpi=200, facecolor='whitesmoke')
 
     # --- Part 2: Confusion Matrices (Semantic Labels & Oracle Included) ---
-    fig_cm, axes_cm = plt.subplots(1, len(MODES), figsize=(54, 12))
+    fig_cm, axes_cm = plt.subplots(1, len(MODES), figsize=(60, 14))
     for i, mode in enumerate(MODES):
         p_path = f"benchmark_results/{mode}_predictions.npy"
         if os.path.exists(p_path):
@@ -106,14 +106,17 @@ def run_viz():
             if len(y_p) == len(y_true):
                 cm = confusion_matrix(y_true, y_p, labels=range(10))
                 disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASS_NAMES)
-                disp.plot(ax=axes_cm[i], cmap='Blues', colorbar=False, xticks_rotation=45)
-                axes_cm[i].set_title(f"{mode.upper()}\nAcc: {accuracy_score(y_true, y_p):.2f}", fontsize=28, fontweight='bold', pad=20)
+                # Use vertical rotation for labels and disable the colorbar for a cleaner look
+                disp.plot(ax=axes_cm[i], cmap='Blues', colorbar=False, xticks_rotation='vertical')
+                axes_cm[i].set_title(f"{mode.upper()}\nAccuracy: {accuracy_score(y_true, y_p):.2f}", fontsize=30, fontweight='bold', pad=30)
+                axes_cm[i].set_xlabel("Predicted", fontsize=24, fontweight='bold')
+                axes_cm[i].set_ylabel("True", fontsize=24, fontweight='bold')
             else:
-                axes_cm[i].text(0.5, 0.5, f"WAITING\n({len(y_p)}/50)", ha='center', va='center', fontsize=26)
+                axes_cm[i].text(0.5, 0.5, f"DATA ERROR\n({len(y_p)}/50)", ha='center', va='center', fontsize=26)
         else:
-            axes_cm[i].text(0.5, 0.5, "NOT READY", ha='center', va='center', fontsize=26)
+            axes_cm[i].text(0.5, 0.5, "MISSING", ha='center', va='center', fontsize=26)
     
-    plt.tight_layout()
+    plt.tight_layout(pad=5.0)
     plt.savefig("benchmark_confusion_matrices.png", dpi=150)
 
     # --- Part 3: Accuracy/Confidence Summary ---
