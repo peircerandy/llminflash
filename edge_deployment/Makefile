@@ -1,13 +1,22 @@
+# Makefile for Flash Engine (Edge Optimized)
 CXX = g++
-CXXFLAGS = -shared -fPIC -O3 -Wall -std=c++17 -march=native -fopenmp
+CXXFLAGS = -shared -fPIC -O3 -Wall -std=c++17 -fopenmp
+LDFLAGS = -Wl,--no-as-needed -lgomp
 
-TARGET = libengine.so
-SOURCES = engine.cpp
+# Detect Architecture
+ARCH := $(shell uname -m)
 
-all: $(TARGET)
+ifeq ($(ARCH), x86_64)
+    CXXFLAGS += -march=native
+else ifneq (,$(filter $(ARCH), aarch64 arm64 armv7l))
+    # ARM-specific optimizations (Pi 4 / Phone)
+    CXXFLAGS += -march=armv8-a+simd -mfpu=neon-fp-armv8
+endif
 
-$(TARGET): $(SOURCES)
-	$(CXX) $(CXXFLAGS) $(SOURCES) -o $(TARGET)
+all: libengine.so
+
+libengine.so: engine.cpp
+	$(CXX) $(CXXFLAGS) engine.cpp -o libengine.so $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f libengine.so

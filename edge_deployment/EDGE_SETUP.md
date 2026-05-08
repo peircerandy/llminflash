@@ -21,17 +21,19 @@ bash Miniforge3-Linux-aarch64.sh
 # 2. Create environment
 conda create -n flash-edge python=3.11 -y
 conda activate flash-edge
-
+```bash
 # 3. Install packages
 pip install -r requirements_edge.txt
 ```
 
 ### 2. Compile the Engine
-The engine is written in C++ and uses OpenMP for multithreading. It also has specific compiler directives for ARM NEON, which makes it particularly fast on Raspberry Pi and modern Android devices.
+**IMPORTANT:** Since you copied these files from your laptop, you **must** clean the old laptop-compiled binary first, or it will fail to load on the Pi.
 
 ```bash
+make clean
 make
 ```
+
 
 ### 3. Transfer Weights
 You do not need to transfer the massive PyTorch models (which would OOM your device anyway). You only need the specific extracted resident layers and the bundled FFN binaries. 
@@ -73,6 +75,16 @@ You can pipe a fresh photo directly from the Pi Camera into the model:
    ```bash
    python edge_clay.py --image test_capture.jpg
    ```
+
+### ⚠️ Troubleshooting the "OpenMP Loop" Hang
+If your Pi displays OpenBLAS warnings and hangs, it's due to a "deadlock" between the C++ Engine and PyTorch's math library.
+
+**The Fix:**
+Run the script with these specific environment flags:
+```bash
+OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python edge_clay.py --mode predictor
+```
+This tells the processors to be "polite" and wait their turn, which prevents the hang.
 
 ### 📡 Feature Telemetry & Classification
 When you run `edge_clay.py`, it generates two small telemetry files:

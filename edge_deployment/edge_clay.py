@@ -1,7 +1,18 @@
 import os
 import sys
+
+# --- CRITICAL: SUPPRESS NOISY OPENBLAS WARNINGS & PREVENT DEADLOCKS ---
+os.environ["OPENBLAS_VERBOSE"] = "0"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "4" # Let our engine use 4 cores, but PyTorch use 1
+
 import time
 import torch
+# Force PyTorch to be single-threaded to avoid OpenMP contention/hangs with our engine
+torch.set_num_threads(1)
+
 import torch.nn as nn
 import ctypes
 import numpy as np
@@ -44,8 +55,8 @@ try:
     lib.destroy_engine.argtypes = [ctypes.c_void_p]
 except Exception as e:
     print(f"\n❌ FAILED TO LOAD ENGINE: {e}")
-    print("\nHELP: This often means a system library is missing on your Pi.")
-    print("Try running: sudo apt-get update && sudo apt-get install libgomp1 -y\n")
+    print("\nHELP: If you see 'Detect OpenMP Loop', try running:")
+    print("export OMP_WAIT_POLICY=PASSIVE\n")
     sys.exit(1)
 
 class FlashViTFFN(nn.Module):
@@ -94,13 +105,7 @@ def main():
     parser.add_argument("--mode", type=str, choices=["predictor", "draft"], default="predictor", help="Flash mode")
     args = parser.parse_args()
 
-    print(f"--- Clay v1.5 Edge Inference: {args.mode.upper()} MODE ---")
-    if not os.path.exists(CKPT_PATH):
-        print(f"Error: Missing {CKPT_PATH}. Please copy or symlink it here.")
-        sys.exit(1)
-    if not os.path.exists(FFN_BIN):
-        print(f"Error: Missing {FFN_BIN}. Please copy or symlink it here.")
-        sys.exit(1)
+    print(f"--- Clay v1.5 Edge Inference: {args.mode.upper()} MODE ---", flush=True)
 
     metadata_yaml = """sentinel-2-l2a:
   band_order: [blue, green, red, rededge1, rededge2, rededge3, nir, nir08, swir16, swir22]
@@ -118,24 +123,36 @@ def main():
     engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN if os.path.exists(PRED_BIN) else b"", 1024, 4096, 24, 0)
     lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
 
-    print("Materializing lean model...")
+    print("Materializing lean model...", flush=True)
     mae_args = {"mask_ratio": 0.0, "norm_pix_loss": False, "shuffle": False, "teacher": "vit_large_patch16_224", "dolls": [], "doll_weights": []}
     with init_empty_weights():
         model = clay_mae_large(metadata=metadata_obj, patch_size=8, decoder_embed_dim=1024, **mae_args)
     model.to_empty(device="cpu")
+    print("✅ Model structure materialized.", flush=True)
 
-    print("Loading resident weights...")
+    print("Loading resident weights (mmap)...", flush=True)
     sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
     state_dict = sd_raw.get("state_dict", sd_raw)
     clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items() if "decoder" not in k and "proj" not in k}
+    
+    print("Applying weights to model...", flush=True)
     model.load_state_dict(clean_sd, strict=False)
+    del sd_raw
+    if "state_dict" in locals(): del state_dict
+    import gc
+    gc.collect()
+    print("✅ Resident weights loaded.", flush=True)
 
+    print("Zero-initializing remaining parameters...", flush=True)
     for name, p in model.named_parameters():
         if name not in clean_sd:
             with torch.no_grad(): p.zero_()
+    del clean_sd
+    gc.collect()
 
-    print(f"Patching FlashFFN ({args.mode.upper()})...")
+    print(f"Patching FlashFFN ({args.mode.upper()})...", flush=True)
     for i in range(24):
+        if i % 4 == 0: print(f"  -> Applying Flash Logic: Layer {i}/24", flush=True)
         ff_block = model.encoder.transformer.layers[i][1]
         fc1_bias = torch.zeros(4096, dtype=torch.float32)
         if args.mode == "draft" and i % 4 == 0:
@@ -150,13 +167,14 @@ def main():
     model.forward = custom_forward
     model.eval()
 
-    print("Running warmup pass...")
+    print("Running warmup pass...", flush=True)
     with torch.no_grad(): _ = model(get_dummy_datacube())
 
-    print(f"Benchmarking Latency on Edge using: {args.image}")
+    print(f"Benchmarking Latency on Edge using: {args.image}", flush=True)
     latencies = []
     datacube = get_real_datacube(args.image)
-    for _ in range(5):
+    for i in range(5):
+        print(f"  [Pass {i+1}/5] Processing model layers via SSD streaming...", flush=True)
         start = time.time()
         with torch.no_grad(): out = model(datacube)
         latencies.append(time.time() - start)
@@ -169,16 +187,14 @@ def main():
     grid_size = int(np.sqrt(features.shape[0]))
     heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
     np.save("edge_output_heatmap.npy", heatmap)
-    
     cls_token = out[0, 0, :].cpu().numpy()
     np.save("edge_output_cls_token.npy", cls_token)
-    
-    print(f"Telemetry saved: Heatmap ({heatmap.nbytes/1024:.1f} KB) + CLS Token ({cls_token.nbytes/1024:.1f} KB)")
     
     import json
     metrics = {"device": os.uname().machine, "mode": args.mode, "avg_latency": avg_lat, "timestamp": time.ctime()}
     with open("edge_metrics.json", "w") as f: json.dump(metrics, f, indent=4)
     
+    print(f"✅ Success! Latency: {avg_lat:.2f}s. Telemetry saved.")
     lib.destroy_engine(engine_ptr)
 
 if __name__ == "__main__":
