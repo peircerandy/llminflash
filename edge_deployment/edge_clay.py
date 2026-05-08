@@ -183,6 +183,19 @@ def main():
     np.save("edge_output_heatmap.npy", heatmap)
     print(f"Successfully saved 2D heatmap to 'edge_output_heatmap.npy' ({heatmap.nbytes/1024:.1f} KB)")
     
+    # --- METRICS LOGGING FOR COMPARISON ---
+    import json
+    metrics = {
+        "device": os.uname().machine,
+        "mode": "predictor",
+        "avg_latency": sum(latencies)/len(latencies),
+        "heatmap_shape": heatmap.shape,
+        "timestamp": time.ctime()
+    }
+    with open("edge_metrics.json", "w") as f:
+        json.dump(metrics, f, indent=4)
+    print("Metrics saved to 'edge_metrics.json'. Use this to compare laptop vs. phone performance!")
+    
     lib.destroy_engine(engine_ptr)
 
 if __name__ == "__main__":
