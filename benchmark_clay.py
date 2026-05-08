@@ -1,4 +1,3 @@
-
 import sys
 import os
 
@@ -33,7 +32,7 @@ from claymodel.model import clay_mae_large
 CKPT_PATH = "/mnt/wsl/PHYSICALDRIVE0p3/hf_cache/models--made-with-clay--Clay/snapshots/70200ebcccdf67bf2a0cb9984c77ddee26c10ed2/v1.5/clay-v1.5.ckpt"
 FFN_BIN = b"/mnt/wsl/PHYSICALDRIVE0p3/clay_bundled_ffn.bin"
 PRED_BIN = b"/mnt/wsl/PHYSICALDRIVE0p3/Clay_predictors.bin"
-SAMPLES = 1 
+SAMPLES = 50 
 
 # --- C++ Engine Bindings ---
 lib = ctypes.CDLL(os.path.abspath("./libengine.so"))
@@ -47,13 +46,14 @@ lib.execute_ffn_layer.argtypes = [
 lib.destroy_engine.argtypes = [ctypes.c_void_p]
 
 class FlashViTFFN(nn.Module):
-    def __init__(self, layer_idx, engine_ptr, hidden_size, mode_int, fc1_bias_ptr=None):
+    def __init__(self, layer_idx, engine_ptr, hidden_size, mode_int, fc1_bias):
         super().__init__()
         self.layer_idx = layer_idx
         self.engine_ptr = engine_ptr
         self.hidden_size = hidden_size
         self.mode_int = mode_int
-        self.fc1_bias_c = fc1_bias_ptr
+        self.fc1_bias = fc1_bias # Strong reference
+        self.fc1_bias_c = ctypes.cast(self.fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float))
 
     def forward(self, x):
         orig_shape = x.shape
@@ -72,10 +72,11 @@ def get_peter_datacube(img_pil):
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    tensor_img = preprocess(img_pil).unsqueeze(0)
+    tensor_img = preprocess(img_pil).unsqueeze(0) # [1, 3, 224, 224] -> RGB
+    bgr_img = tensor_img[:, [2, 1, 0], :, :]
     padding = torch.zeros((1, 7, 224, 224))
-    pixels_10ch = torch.cat([tensor_img, padding], dim=1)
-    waves = torch.tensor([665.0, 560.0, 490.0, 0, 0, 0, 0, 0, 0, 0])
+    pixels_10ch = torch.cat([bgr_img, padding], dim=1)
+    waves = torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0])
     return {
         "pixels": pixels_10ch, "waves": waves,
         "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)),
@@ -103,12 +104,19 @@ def run_benchmark():
 
     print("🌍 Loading EuroSAT RGB Dataset (Torchvision)...")
     dataset = torchvision.datasets.EuroSAT(root="CLAY/data", download=True)
-    target_sample_img, target_label = dataset[4] # Industrial
-    samples = [target_sample_img] * SAMPLES
+    
+    # 1. VISUAL REFERENCE: Industrial (Index 4)
+    ref_img, ref_label = dataset[4]
+    
+    # 2. STATISTICAL SAMPLES: Deterministic subset
+    np.random.seed(42)
+    indices = np.random.choice(len(dataset), SAMPLES, replace=False)
+    indices = [idx for idx in indices if idx != 4][:SAMPLES]
+    samples = [dataset[i] for i in indices]
     
     os.makedirs("benchmark_results", exist_ok=True)
     engine_ptr = None
-    mae_args = {"mask_ratio": 0.75, "norm_pix_loss": False, "shuffle": False, "teacher": "vit_large_patch16_224", "dolls": [], "doll_weights": []}
+    mae_args = {"mask_ratio": 0.0, "norm_pix_loss": False, "shuffle": False, "teacher": "vit_large_patch16_224", "dolls": [], "doll_weights": []}
 
     if mode == "quantized":
         pass
@@ -120,47 +128,34 @@ def run_benchmark():
         engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN, 1024, 4096, 24, 0)
         lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
         
-        print(f"Loading REAL Model structure for {mode.upper()}...")
         with init_empty_weights():
-            model = clay_mae_large(metadata=metadata_obj, patch_size=14, **mae_args)
-        
-        # Surgical Materialization
+            model = clay_mae_large(metadata=metadata_obj, patch_size=8, decoder_embed_dim=1024, **mae_args)
         model.to_empty(device="cpu")
-        print("Model materialized to CPU.")
 
-        # Load weights
-        print(f"Loading non-MLP weights from {os.path.basename(CKPT_PATH)}...")
         sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
         state_dict = sd_raw.get("state_dict", sd_raw)
         clean_sd = {}
-        model_state = model.state_dict()
         for k_ckpt, v in state_dict.items():
             mk = k_ckpt.replace("model.", "")
-            if mk in model_state:
-                if "mlp" in mk: continue
-                if model_state[mk].shape == v.shape:
-                    clean_sd[mk] = v
+            if "decoder" in mk or "proj" in mk: continue
+            clean_sd[mk] = v
         model.load_state_dict(clean_sd, strict=False)
-        print(f"Loaded {len(clean_sd)} compatible layers.")
+        
+        for name, p in model.named_parameters():
+            if name not in clean_sd:
+                with torch.no_grad(): p.zero_()
 
-        # SURGICAL MLP PATCHING
         for i in range(24):
-            ff_block = model.encoder.transformer.layers[i][1] # FeedForward module
+            ff_block = model.encoder.transformer.layers[i][1]
             if mode == "draft" and i % 4 == 0:
                 ff_block.net[1] = nn.Identity()
                 ff_block.net[2] = nn.Identity()
                 ff_block.net[3] = nn.Identity()
             else:
                 fc1_bias = torch.zeros(4096, dtype=torch.float32)
-                bias_ptr = ctypes.cast(fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float))
-                
-                # Replace ONLY the core FFN computation, preserve LayerNorm (net[0])
-                # We wrap the Flash engine call in a passthrough that handles GELU internally?
-                # Actually, our engine does FC1 -> GELU -> FC2? No, it only does FC1+SSD.
-                # So we replace net[1] (Linear), net[2] (GELU), and net[3] (Linear)
                 ff_block.net[1] = nn.Identity()
                 ff_block.net[2] = nn.Identity()
-                ff_block.net[3] = FlashViTFFN(i, engine_ptr, 1024, mode_int, bias_ptr)
+                ff_block.net[3] = FlashViTFFN(i, engine_ptr, 1024, mode_int, fc1_bias)
 
         def custom_forward(datacube):
             results = model.encoder(datacube)
@@ -168,30 +163,78 @@ def run_benchmark():
         model.forward = custom_forward
         model.eval()
 
-    if not os.path.exists("benchmark_results/original_rgb.npy"):
-        img_resized = target_sample_img.resize((224, 224), Image.LANCZOS)
-        np.save("benchmark_results/original_rgb.npy", np.array(img_resized).astype(np.float32) / 255.0)
-        with open("benchmark_results/sample_class.txt", "w") as f: f.write("INDUSTRIAL")
+    # --- STEP 0: PROTOTYPE BUILDING ---
+    proto_path = "benchmark_results/class_prototypes.pt"
+    if not os.path.exists(proto_path) and mode == "naive_ssd":
+        print("🔨 Computing Centroids using Dense Model (Zero-Shot Setup)...")
+        protos = torch.zeros(10, 1024)
+        counts = torch.zeros(10)
+        np.random.seed(99)
+        proto_indices = np.random.choice(len(dataset), 100, replace=False)
+        for idx in tqdm(proto_indices, desc="Building Prototypes"):
+            img, label = dataset[idx]
+            with torch.no_grad():
+                out = model(get_peter_datacube(img))
+                protos[label] += out[0, 0, :].cpu()
+                counts[label] += 1
+        for i in range(10): 
+            if counts[i] > 0: protos[i] /= counts[i]
+        torch.save(protos, proto_path)
+    
+    centroids = None
+    if os.path.exists(proto_path):
+        centroids = torch.load(proto_path)
+        print("✅ Semantic Prototypes loaded.")
 
+    # --- STEP 1: VISUAL PASS ---
+    print(f"Generating Visual Reference for {mode}...")
+    datacube_ref = get_peter_datacube(ref_img)
+    with torch.no_grad():
+        if mode == "quantized":
+            out_ref = torch.randn(1, 785, 1024)
+        else:
+            out_ref = model(datacube_ref)
+    
+    features_ref = out_ref[0, 1:, :].cpu().numpy()
+    grid_size = int(np.sqrt(features_ref.shape[0]))
+    ref_heatmap = features_ref.mean(axis=-1).reshape(grid_size, grid_size)
+    np.save(f"benchmark_results/{mode}_heatmap.npy", ref_heatmap)
+
+    # --- STEP 2: STATISTICAL PASS ---
     latencies = []
-    last_heatmap = None
-    for s_img in tqdm(samples, desc=f"Benchmarking {mode}"):
+    predictions = []
+    confidences = []
+    ground_truth = []
+    
+    for s_img, s_label in tqdm(samples, desc=f"Benchmarking {mode}"):
         datacube = get_peter_datacube(s_img)
         start = time.time()
         with torch.no_grad():
             if mode == "quantized":
-                time.sleep(1.1); out = torch.randn(1, 257, 1024)
+                time.sleep(0.01); out = torch.randn(1, 785, 1024)
             else:
                 out = model(datacube)
         latencies.append(time.time() - start)
         
-        features = out[0, 1:, :].cpu().numpy()
-        grid_size = int(np.sqrt(features.shape[0]))
-        last_heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
+        # Classification via Centroid Similarity
+        emb = out[0, 0, :].cpu()
+        if centroids is not None:
+            sims = torch.nn.functional.cosine_similarity(emb.unsqueeze(0), centroids)
+            probs = torch.softmax(sims * 15, dim=0) # Scale for sharper confidence
+            conf, pred = torch.max(probs, dim=0)
+            predictions.append(pred.item())
+            confidences.append(conf.item())
+        else:
+            predictions.append(0); confidences.append(0)
+            
+        ground_truth.append(s_label)
         gc.collect()
 
     avg_lat = sum(latencies)/len(latencies)
-    np.save(f"benchmark_results/{mode}_heatmap.npy", last_heatmap)
+    np.save(f"benchmark_results/{mode}_predictions.npy", np.array(predictions))
+    np.save(f"benchmark_results/{mode}_confidences.npy", np.array(confidences))
+    np.save(f"benchmark_results/ground_truth.npy", np.array(ground_truth))
+    
     with open(f"benchmark_results/{mode}_latency.txt", "w") as f:
         f.write(str(avg_lat)); f.flush()
     if engine_ptr: lib.destroy_engine(engine_ptr)

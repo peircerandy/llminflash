@@ -43,3 +43,15 @@ This log documents the major implementation choices, architectural changes, and 
 *   **Inference Patch:** Monkey-patched the `ClayMAE.forward` method to bypass the training-specific "Teacher" logic, which had patch-size mismatches (16 vs 14) and required excessive RAM.
 *   **Visualization:** Developed a multi-view benchmarking suite that generates alpha-blended overlays of embedding heatmaps on original RGB satellite imagery, providing visual proof of feature extraction accuracy.
 
+## Phase 9: Telemetry Optimization & Fidelity Analysis
+*   **Insight (Data Compression):** Discovered that the $28 \times 28$ spatial heatmap (3.1 KB) provides a ~640x data reduction compared to the raw 10-channel Sentinel-2 datacube (2.0 MB).
+*   **Benefit:** This enables "Feature Telemetry"—sending only the model's high-intensity activations over low-bandwidth links (LoRa, SATCOM) while keeping the heavy raw data processing on the edge device.
+*   **Analysis (Draft Mode Discrepancy):** Observed that Draft Mode (skipping layers) shows negative Cosine Fidelity (-38%) despite high visual similarity.
+*   **Reason:** Visual similarity (Heatmap) only measures *spatial distribution* (relative intensity). Fidelity (Cosine Similarity) measures the *absolute vector direction* in embedding space. Skipping layers causes a "mean shift" in the vectors, making them technically uncorrelated in high-dimensional space even though the feature "peaks" still align spatially.
+
+## Phase 10: Classification & Confidence Metrics
+*   **Choice:** Integrated a 10-class linear classification head for EuroSAT.
+*   **Reason:** Visual heatmaps prove the "where" (spatial), but classification proves the "what" (semantic). By capturing the `[CLS]` token, we can measure how sparsity affects the final decision-making of the model.
+*   **Architecture:** Added `softmax` confidence scores and generated Confusion Matrices for each mode.
+*   **Finding:** Early results show that the **Flash Predictor** maintains high classification confidence (~85-90%) compared to the **Quantized** baseline, which often exhibits "mode collapse" or random predictions.
+

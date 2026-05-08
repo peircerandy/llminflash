@@ -73,8 +73,13 @@ def run_accuracy_benchmark():
         yval = bar.get_height()
         ax1.text(bar.get_x() + bar.get_width()/2, yval + 0.5, f'{yval:.1f}%', ha='center', va='bottom', fontweight='bold', fontsize=14)
 
-    plt.title("PROFESSIONAL FIDELITY METRICS: FLASH vs. DENSE\n(Preservation of model 'signal' during sparse loading)", fontsize=16, fontweight='bold')
-    plt.tight_layout()
+    plt.title("VECTOR FIDELITY: FLASH vs. DENSE\n(Preservation of mathematical 'meaning' in embedding space)", fontsize=16, fontweight='bold')
+    
+    # Footnote about Draft mode
+    fig.text(0.5, 0.02, "*Note: Draft mode skips layers, causing a 'mean shift' in vectors (Low Fidelity) while often preserving spatial alignment (Visual Similarity).", 
+             ha="center", fontsize=10, style='italic', color='darkred')
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
     plt.savefig("accuracy_comparison.png", dpi=150)
     print(f"DEBUG: Success! Generated 'accuracy_comparison.png' with {len(df)} bars.")
 

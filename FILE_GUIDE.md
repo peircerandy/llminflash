@@ -32,3 +32,23 @@ These files form the heart of the "LLM in a Flash" replication.
 *   **`manual_test.py`**: An early experiment in manual forward-pass patching that didn't use the final `FlashFFN` class.
 *   **`speed_test copy.py`**: Likely an accidental duplicate.
 
+## 📡 Feature Telemetry & Data Compression
+
+This project demonstrates a massive data reduction benefit for edge computing. Instead of sending raw, 10-channel satellite imagery over low-bandwidth links, we process the data on the edge and only transmit the "Points of Interest" (Heatmap).
+
+### Data Size Comparison Table
+| Asset Type | Resolution | Size (approx) | Benefit |
+| :--- | :--- | :--- | :--- |
+| **Input Datacube** | $224 \times 224 \times 10$ | **~2.0 MB** | Full raw data (Hard to move) |
+| **Output Embedding** | $785 \times 1024$ | **~3.2 MB** | High-dim semantic meaning |
+| **Feature Heatmap** | $28 \times 28 \times 1$ | **~3.1 KB** | **640x Compression vs Input** |
+
+### How the Heatmap is Derived
+The Clay model (Vision Transformer) outputs a sequence of $785$ tokens, where each token is a $1024$-dimensional vector.
+1. **Token Mapping:** Token index 0 is the `[CLS]` (class) token. Indices 1-784 correspond to the $28 \times 28$ spatial grid.
+2. **Feature Squeezing:** We take the absolute mean (or magnitude) of the $1024$ features for each grid token.
+   - $H_{i,j} = \text{mean}(|V_{token}|)$
+3. **Result:** This collapses the massive embedding into a simple 2D map showing where the model "sees" intense features.
+
+**Presentation Hook:** *"On the edge, we don't send pixels; we send importance. We use the Flash Engine to extract 3 KB of 'intent' from 2 MB of raw data, enabling satellite-based AI alerts over even the narrowest radio links."*
+

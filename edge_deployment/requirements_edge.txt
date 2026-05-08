@@ -1,0 +1,11 @@
+torch
+transformers
+numpy
+Pillow
+accelerate
+scipy
+tqdm
+box
+pyyaml
+torchvision
+timm
