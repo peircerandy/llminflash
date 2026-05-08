@@ -27,8 +27,13 @@ FFN_BIN = b"clay_bundled_ffn.bin"
 PRED_BIN = b"Clay_predictors.bin"
 
 # --- C++ Engine Bindings ---
+engine_path = os.path.abspath("./libengine.so")
+if not os.path.exists(engine_path):
+    print(f"CRITICAL: {engine_path} not found. Run 'make' first.")
+    sys.exit(1)
+
 try:
-    lib = ctypes.CDLL(os.path.abspath("./libengine.so"))
+    lib = ctypes.CDLL(engine_path)
     lib.init_engine.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
     lib.init_engine.restype = ctypes.c_void_p
     lib.set_engine_config.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_float, ctypes.c_int]
@@ -38,7 +43,9 @@ try:
     ]
     lib.destroy_engine.argtypes = [ctypes.c_void_p]
 except Exception as e:
-    print(f"Failed to load libengine.so. Did you run 'make'? Error: {e}")
+    print(f"\n❌ FAILED TO LOAD ENGINE: {e}")
+    print("\nHELP: This often means a system library is missing on your Pi.")
+    print("Try running: sudo apt-get update && sudo apt-get install libgomp1 -y\n")
     sys.exit(1)
 
 class FlashViTFFN(nn.Module):

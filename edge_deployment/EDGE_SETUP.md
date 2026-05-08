@@ -7,6 +7,12 @@ This folder contains the minimum necessary scripts to compile the Flash Engine a
 ### 1. Install Dependencies (Raspberry Pi / Termux)
 I recommend using **Miniforge** (Conda for ARM) to manage your environment on the Pi.
 
+**System Level (Run this first on Pi):**
+```bash
+sudo apt-get update && sudo apt-get install libgomp1 -y
+```
+
+**Python Level:**
 ```bash
 # 1. Download and Install Miniforge
 wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh
@@ -68,6 +74,14 @@ You can pipe a fresh photo directly from the Pi Camera into the model:
    python edge_clay.py --image test_capture.jpg
    ```
 
+### 📡 Feature Telemetry & Classification
+When you run `edge_clay.py`, it generates two small telemetry files:
+1. `edge_output_heatmap.npy` (~3KB): Spatial features.
+2. `edge_output_cls_token.npy` (~4KB): Semantic embedding.
+
+**To classify your camera photo:**
+Copy the `edge_output_cls_token.npy` back to your laptop and run the classification suite. This allows you to perform heavy "accuracy" math on your powerful machine without overloading the Pi.
+
 ### 🔄 Round-Trip Workflow
 
 To create a professional comparison for your presentation:
@@ -104,3 +118,8 @@ To create a professional comparison for your presentation:
    python graph_edge_results.py
    ```
    This generates `edge_performance_comparison.png`.
+
+**Test Causal LLM:**
+```bash
+python chat.py --mode predictor
+```
