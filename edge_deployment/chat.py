@@ -170,7 +170,12 @@ def chat(args):
     print("\nREADY. Type 'exit' to quit.\n")
     while True:
         try:
-            user_input = input("YOU: ")
+            try:
+                user_input = input("YOU: ")
+            except EOFError:
+                print("\n[EOF] Ending non-interactive benchmark.")
+                break
+                
             if user_input.lower() in ["quit", "exit"]: break
             inputs = tokenizer(user_input, return_tensors="pt").to(model.device)
             timer.start()

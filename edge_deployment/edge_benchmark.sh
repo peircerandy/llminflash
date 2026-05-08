@@ -2,6 +2,18 @@
 
 # --- LLM IN A FLASH: Edge Benchmark Suite ---
 IMAGE="sample_satellite.png"
+RUN_LLM=false
+
+# Parse flags
+for arg in "$@"
+do
+    case $arg in
+        --llm)
+        RUN_LLM=true
+        shift
+        ;;
+    esac
+done
 
 echo "==============================================="
 echo "   STARTING EDGE DEPLOYMENT BENCHMARKS        "
@@ -19,6 +31,14 @@ OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python edge_clay.py --mode predictor 
 echo -e "\n[3/3] RUNNING DENSE MODE (Standard PyTorch Baseline)..."
 echo "Note: This mode is expected to trigger an OOM (Out of Memory) crash on Pi 4B."
 OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python edge_clay.py --mode dense --image $IMAGE
+
+# Optional LLM Benchmark
+if [ "$RUN_LLM" = true ] ; then
+    echo -e "\n[OPTIONAL] RUNNING LLM PREDICTOR BENCHMARK (OPT-6.7b)..."
+    echo "This will test Causal LLM generation speed (Tokens Per Second)."
+    # Pipe 'exit' to quit after first generation
+    echo "What is the capital of France?" | OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python chat.py --mode predictor
+fi
 
 echo -e "\n==============================================="
 echo "   BENCHMARKS COMPLETE                        "
