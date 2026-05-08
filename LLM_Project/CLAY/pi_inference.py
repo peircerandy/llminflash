@@ -5,6 +5,8 @@ from PIL import Image
 from claymodel.module import ClayMAEModule
 from peft import LoraConfig, get_peft_model
 import time
+import os
+import glob
 
 # 🚀 1. Force CPU mode (Raspberry Pi has no CUDA)
 device = torch.device("cpu")
@@ -110,10 +112,37 @@ def predict_image(image_path):
 # 🎯 Execution block
 # ==========================================
 if __name__ == "__main__":
-    # Put a test image on the Raspberry Pi, then update this filename.
-    test_photo = "CLAY/sample_tests/test_img_2_TrueLabel_HerbaceousVegetation.jpg"
+    test_folder = "sample_tests"
 
-    try:
-        predict_image(test_photo)
-    except FileNotFoundError:
-        print(f"Image not found: {test_photo}. Please verify filename and path.")
+    # Collect all JPG and PNG images in the folder
+    image_paths = glob.glob(os.path.join(test_folder, "*.jpg"))
+
+    # Sort by filename for cleaner output
+    image_paths = sorted(image_paths)
+
+    if not image_paths:
+        print(f"⚠️ No images found in folder '{test_folder}'. Please check the path.")
+    else:
+        print(
+            f"📂 Found {len(image_paths)} image(s). Model is resident in memory; starting batch prediction...\n"
+        )
+
+        # Total elapsed time for the entire batch
+        total_start_time = time.time()
+
+        for img_path in image_paths:
+            try:
+                predict_image(img_path)
+            except Exception as e:
+                print(f"❌ Error while processing {img_path}: {e}")
+
+        total_end_time = time.time()
+        total_duration = total_end_time - total_start_time
+
+        # Print final statistics
+        print("=" * 40)
+        print("✅ Batch prediction completed.")
+        print(f"🖼️ Total images processed: {len(image_paths)}")
+        print(f"⏱️ Total prediction time: {total_duration:.2f} s")
+        print(f"⚡ Average time per image: {(total_duration / len(image_paths)):.2f} s")
+        print("=" * 40)

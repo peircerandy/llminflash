@@ -48,6 +48,7 @@ speed_test copy.py
 *.bin
 *.csv
 *.png
+*.jpg
 # Ignore heavy model data/cache if stored locally
 /mnt/wsl/
 
