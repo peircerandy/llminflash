@@ -22,7 +22,7 @@ timm.create_model = mock_create_model
 
 from claymodel.model import clay_mae_large
 
-CKPT_PATH = "clay-v1.5.ckpt" # Assume in same dir or symlinked
+CKPT_PATH = "clay-v1.5.ckpt" 
 FFN_BIN = b"clay_bundled_ffn.bin"
 PRED_BIN = b"Clay_predictors.bin"
 
@@ -63,45 +63,31 @@ class FlashViTFFN(nn.Module):
         return out_cpu.to(x.device).view(*orig_shape)
 
 def get_dummy_datacube():
-    # Sentinel-2 BGR 10-channel 224x224 dummy
     pixels_10ch = torch.randn(1, 10, 224, 224)
     waves = torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0])
-    return {
-        "pixels": pixels_10ch, "waves": waves,
-        "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)),
-        "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]
-    }
+    return {"pixels": pixels_10ch, "waves": waves, "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)), "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]}
 
 def get_real_datacube(img_path):
     if not os.path.exists(img_path):
         print(f"Warning: {img_path} not found, using random noise.")
         return get_dummy_datacube()
-        
     img_pil = Image.open(img_path).convert("RGB")
-    preprocess = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    tensor_img = preprocess(img_pil).unsqueeze(0) # [1, 3, 224, 224] -> RGB
-    # REORDER RGB -> BGR to match Clay/S2 default order: [blue, green, red, ...]
+    preprocess = T.Compose([T.Resize((224, 224)), T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+    tensor_img = preprocess(img_pil).unsqueeze(0)
     bgr_img = tensor_img[:, [2, 1, 0], :, :]
     padding = torch.zeros((1, 7, 224, 224))
     pixels_10ch = torch.cat([bgr_img, padding], dim=1)
     waves = torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0])
-    return {
-        "pixels": pixels_10ch, "waves": waves,
-        "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)),
-        "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]
-    }
+    return {"pixels": pixels_10ch, "waves": waves, "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)), "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]}
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", type=str, default="sample_satellite.png", help="Path to input image (Satellite or Camera photo)")
+    parser.add_argument("--image", type=str, default="sample_satellite.png", help="Path to input image")
+    parser.add_argument("--mode", type=str, choices=["predictor", "draft"], default="predictor", help="Flash mode")
     args = parser.parse_args()
 
-    print("--- Clay v1.5 Edge Inference Test ---")
+    print(f"--- Clay v1.5 Edge Inference: {args.mode.upper()} MODE ---")
     if not os.path.exists(CKPT_PATH):
         print(f"Error: Missing {CKPT_PATH}. Please copy or symlink it here.")
         sys.exit(1)
@@ -122,7 +108,6 @@ def main():
     with open("configs/metadata.yaml", "w") as f: f.write(metadata_yaml)
     metadata_obj = Box(yaml.safe_load(metadata_yaml))
 
-    # Initialize Engine (mode=0 -> Predictor)
     engine_ptr = lib.init_engine(FFN_BIN, PRED_BIN if os.path.exists(PRED_BIN) else b"", 1024, 4096, 24, 0)
     lib.set_engine_config(engine_ptr, 1024, 0.5, 5)
 
@@ -135,24 +120,22 @@ def main():
     print("Loading resident weights...")
     sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
     state_dict = sd_raw.get("state_dict", sd_raw)
-    clean_sd = {}
-    for k, v in state_dict.items():
-        mk = k.replace("model.", "")
-        if "decoder" in mk or "proj" in mk: continue
-        clean_sd[mk] = v
+    clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items() if "decoder" not in k and "proj" not in k}
     model.load_state_dict(clean_sd, strict=False)
 
     for name, p in model.named_parameters():
         if name not in clean_sd:
             with torch.no_grad(): p.zero_()
 
-    print("Patching FlashFFN...")
+    print(f"Patching FlashFFN ({args.mode.upper()})...")
     for i in range(24):
         ff_block = model.encoder.transformer.layers[i][1]
         fc1_bias = torch.zeros(4096, dtype=torch.float32)
-        ff_block.net[1] = nn.Identity()
-        ff_block.net[2] = nn.Identity()
-        ff_block.net[3] = FlashViTFFN(i, engine_ptr, 1024, 0, fc1_bias)
+        if args.mode == "draft" and i % 4 == 0:
+            ff_block.net[1], ff_block.net[2], ff_block.net[3] = nn.Identity(), nn.Identity(), nn.Identity()
+        else:
+            ff_block.net[1], ff_block.net[2] = nn.Identity(), nn.Identity()
+            ff_block.net[3] = FlashViTFFN(i, engine_ptr, 1024, 0, fc1_bias)
 
     def custom_forward(datacube):
         results = model.encoder(datacube)
@@ -161,40 +144,33 @@ def main():
     model.eval()
 
     print("Running warmup pass...")
-    with torch.no_grad():
-        out = model(get_dummy_datacube())
+    with torch.no_grad(): _ = model(get_dummy_datacube())
 
-    print(f"Benchmarking Predictor latency on Edge using: {args.image}")
+    print(f"Benchmarking Latency on Edge using: {args.image}")
     latencies = []
     datacube = get_real_datacube(args.image)
-    
     for _ in range(5):
         start = time.time()
-        with torch.no_grad():
-            out = model(datacube)
+        with torch.no_grad(): out = model(datacube)
         latencies.append(time.time() - start)
     
-    print(f"Average Latency (5 runs): {sum(latencies)/len(latencies):.2f} seconds")
+    avg_lat = sum(latencies)/len(latencies)
+    print(f"Average Latency: {avg_lat:.2f} seconds")
     
-    # Save the result as a tiny heatmap for telemetry
+    # TELEMETRY EXPORT
     features = out[0, 1:, :].cpu().numpy()
     grid_size = int(np.sqrt(features.shape[0]))
     heatmap = features.mean(axis=-1).reshape(grid_size, grid_size)
     np.save("edge_output_heatmap.npy", heatmap)
-    print(f"Successfully saved 2D heatmap to 'edge_output_heatmap.npy' ({heatmap.nbytes/1024:.1f} KB)")
     
-    # --- METRICS LOGGING FOR COMPARISON ---
+    cls_token = out[0, 0, :].cpu().numpy()
+    np.save("edge_output_cls_token.npy", cls_token)
+    
+    print(f"Telemetry saved: Heatmap ({heatmap.nbytes/1024:.1f} KB) + CLS Token ({cls_token.nbytes/1024:.1f} KB)")
+    
     import json
-    metrics = {
-        "device": os.uname().machine,
-        "mode": "predictor",
-        "avg_latency": sum(latencies)/len(latencies),
-        "heatmap_shape": heatmap.shape,
-        "timestamp": time.ctime()
-    }
-    with open("edge_metrics.json", "w") as f:
-        json.dump(metrics, f, indent=4)
-    print("Metrics saved to 'edge_metrics.json'. Use this to compare laptop vs. phone performance!")
+    metrics = {"device": os.uname().machine, "mode": args.mode, "avg_latency": avg_lat, "timestamp": time.ctime()}
+    with open("edge_metrics.json", "w") as f: json.dump(metrics, f, indent=4)
     
     lib.destroy_engine(engine_ptr)
 
