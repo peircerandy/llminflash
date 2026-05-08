@@ -34,10 +34,16 @@ OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python edge_clay.py --mode dense --im
 
 # Optional LLM Benchmark
 if [ "$RUN_LLM" = true ] ; then
-    echo -e "\n[OPTIONAL] RUNNING LLM PREDICTOR BENCHMARK (OPT-6.7b)..."
-    echo "This will test Causal LLM generation speed (Tokens Per Second)."
-    # Pipe 'exit' to quit after first generation
+    echo -e "\n[OPTIONAL] RUNNING LLM BENCHMARKS (OPT-6.7b)..."
+    
+    echo -e "\n[1/3] LLM DRAFT MODE (Fastest)..."
+    echo "What is the capital of France?" | OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python chat.py --mode draft
+    
+    echo -e "\n[2/3] LLM PREDICTOR MODE (Our Contribution)..."
     echo "What is the capital of France?" | OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python chat.py --mode predictor
+    
+    echo -e "\n[3/3] LLM NAIVE MODE (Dense Baseline)..."
+    echo "What is the capital of France?" | OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python chat.py --mode naive
 fi
 
 echo -e "\n==============================================="

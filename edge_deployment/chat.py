@@ -142,24 +142,35 @@ def chat(args):
                 lib.set_predictor_layer_info(engine_ptr, i, meta['rank'], ctypes.c_size_t(offset))
                 offset += (meta['hidden_size'] * meta['rank']) + (meta['ffn_dim'] * meta['rank'])
         lib.set_engine_config(engine_ptr, args.top_k, args.threshold, args.window)
-        mode_int = {"predictor": 0, "oracle": 1, "naive": 2, "speculative_custom": 0}[args.mode]
+        
+        # Engine Modes: 0=Predictor, 1=Naive, 2=Oracle
+        mode_int = {"predictor": 0, "oracle": 2, "naive": 1, "draft": 0}[args.mode]
+        
         config = AutoConfig.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH)
         with init_empty_weights(): model = AutoModelForCausalLM.from_config(config)
         globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
         for k, v in globals_sd.items():
             target = model.model if k.startswith("decoder.") else model
             set_module_tensor_to_device(target, k, DEVICE, value=v, dtype=torch.float16)
-        print("Loading layers and patching...")
+        
+        print(f"Loading layers and patching ({args.mode.upper()})...")
         for i in range(NUM_LAYERS):
             layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu")
             layer = model.model.decoder.layers[i]
-            fc1_b = layer_sd[f"decoder.layers.{i}.fc1.bias"].float().cpu().contiguous()
-            fc2_b = layer_sd[f"decoder.layers.{i}.fc2.bias"].float().cpu().contiguous()
-            for k, v in layer_sd.items():
-                if ".bias" in k: continue
-                set_module_tensor_to_device(layer, k.replace(f"decoder.layers.{i}.", ""), DEVICE, value=v, dtype=torch.float16)
-            layer.fc1 = FlashFFN(i, engine_ptr, fc1_b, fc2_b, mode_int)
-            layer.fc2 = nn.Identity(); layer.activation_fn = nn.Identity()
+            
+            if args.mode == "draft" and i % 4 == 0:
+                # Layer Skipping for LLM Draft mode
+                layer.fc1 = nn.Identity()
+                layer.fc2 = nn.Identity()
+                layer.activation_fn = nn.Identity()
+            else:
+                fc1_b = layer_sd[f"decoder.layers.{i}.fc1.bias"].float().cpu().contiguous()
+                fc2_b = layer_sd[f"decoder.layers.{i}.fc2.bias"].float().cpu().contiguous()
+                for k, v in layer_sd.items():
+                    if ".bias" in k: continue
+                    set_module_tensor_to_device(layer, k.replace(f"decoder.layers.{i}.", ""), DEVICE, value=v, dtype=torch.float16)
+                layer.fc1 = FlashFFN(i, engine_ptr, fc1_b, fc2_b, mode_int)
+                layer.fc2 = nn.Identity(); layer.activation_fn = nn.Identity()
             del layer_sd; gc.collect()
 
     if "speculative" in args.mode:
@@ -188,7 +199,7 @@ def chat(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Interactive Chat CLI for LLM-in-a-Flash.")
-    p.add_argument('--mode', choices=['predictor', 'oracle', 'naive', 'quantized', 'speculative_custom'], default='predictor', help="Inference mode")
+    p.add_argument('--mode', choices=['predictor', 'oracle', 'naive', 'quantized', 'speculative_custom', 'draft'], default='predictor', help="Inference mode")
     p.add_argument('--predictor', type=str, help="Path to .bin predictor")
     p.add_argument('--top_k', type=int, default=1024)
     p.add_argument('--threshold', type=float, default=0.2)
