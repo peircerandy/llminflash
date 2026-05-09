@@ -194,32 +194,54 @@ def chat(args):
         model.to_empty(device="cpu")
         print("✅ Structure ready.", flush=True)
         
+        def smart_load(target_module, state_dict, name_hint=""):
+            """Tries to load weights even if prefixes (model. or decoder.) are slightly different."""
+            target_sd = target_module.state_dict()
+            clean_sd = {}
+            loaded_count = 0
+            
+            # Try to match keys by stripping common prefixes
+            for k_ckpt, v in state_dict.items():
+                # Potential keys: 'model.decoder.embed_tokens.weight', 'decoder.embed_tokens.weight'
+                # Target keys: 'model.decoder.embed_tokens.weight' or 'decoder.embed_tokens.weight'
+                
+                match_key = None
+                if k_ckpt in target_sd: match_key = k_ckpt
+                elif k_ckpt.replace("model.", "") in target_sd: match_key = k_ckpt.replace("model.", "")
+                elif f"model.{k_ckpt}" in target_sd: match_key = f"model.{k_ckpt}"
+                
+                if match_key and target_sd[match_key].shape == v.shape:
+                    clean_sd[match_key] = v.half()
+                    loaded_count += 1
+            
+            msg = target_module.load_state_dict(clean_sd, strict=False)
+            print(f"  -> {name_hint}: Loaded {loaded_count} layers. Missing: {len(msg.missing_keys)}", flush=True)
+            return msg
+
+        print("Loading global resident layers (Embeddings/Norms/Head)...", flush=True)
         globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
-        print("Loading global resident layers (Embeddings/Norms)...", flush=True)
-        # Fix keys and load
-        clean_globals = {k.replace("model.", ""): v.half() for k, v in globals_sd.items()}
-        model.load_state_dict(clean_globals, strict=False)
+        smart_load(model, globals_sd, "Globals")
         
         print(f"Loading layers and patching ({args.mode.upper()})...", flush=True)
         for i in range(NUM_LAYERS):
-            # Frequent heartbeats for slow SD cards
             if i % 4 == 0: print(f"  -> Applying Flash Logic: Decoder Block {i}/{NUM_LAYERS}...", flush=True)
             layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu")
-            layer = model.model.decoder.layers[i]
+            layer = model.model.decoder.layers[i] if hasattr(model.model, "decoder") else model.model.layers[i]
             
             if args.mode == "draft" and i % 4 == 0:
-                # OPT residual: x = x + self.fc2(self.act(self.fc1(norm(x))))
-                # To skip, we must return 0 so the addition is a no-op
                 layer.fc1 = ZeroModule(16384)
                 layer.fc2 = nn.Identity()
                 layer.activation_fn = nn.Identity()
             else:
-                # Load Attention weights
-                clean_layer = {k.replace(f"decoder.layers.{i}.", ""): v.half() for k, v in layer_sd.items() if "fc" not in k}
-                layer.load_state_dict(clean_layer, strict=False)
+                # Load Attention weights into the specific layer
+                smart_load(layer, layer_sd, f"Block {i}")
                 
-                fc1_b = layer_sd[f"decoder.layers.{i}.fc1.bias"].float().cpu().contiguous()
-                fc2_b = layer_sd[f"decoder.layers.{i}.fc2.bias"].float().cpu().contiguous()
+                # Extract FFN biases for the engine
+                # OPT keys: 'decoder.layers.0.fc1.bias' -> 'fc1.bias'
+                fc1_b, fc2_b = None, None
+                for k, v in layer_sd.items():
+                    if "fc1.bias" in k: fc1_b = v.float().cpu().contiguous()
+                    if "fc2.bias" in k: fc2_b = v.float().cpu().contiguous()
                 
                 layer.fc1 = FlashFFN(i, engine_ptr, fc1_b, fc2_b, mode_int)
                 layer.fc2 = nn.Identity(); layer.activation_fn = nn.Identity()
