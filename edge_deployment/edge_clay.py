@@ -141,6 +141,14 @@ def main():
     sd_raw = torch.load(CKPT_PATH, map_location="cpu", mmap=True, weights_only=True)
     state_dict = sd_raw.get("state_dict", sd_raw)
     
+    # 1. Globals and Structure
+    for k, v in state_dict.items():
+        if "model." in k: k = k.replace("model.", "")
+        if "proj.weight" in k and v.shape != model.proj.weight.shape:
+            print(f"  -> Resizing proj layer to match checkpoint: {v.shape}")
+            model.proj = nn.Linear(v.shape[1], v.shape[0])
+            break
+            
     if args.mode == "dense":
         # Load EVERYTHING for dense baseline
         clean_sd = {k.replace("model.", ""): v for k, v in state_dict.items()}
