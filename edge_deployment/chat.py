@@ -122,7 +122,21 @@ class StreamAndTimer:
         self.is_running = False
         if self.thread: self.thread.join(timeout=1.0)
         elapsed = time.time() - self.start_time
-        print(f"\n[Done] TPS: {self.token_count / elapsed:.2f}\n")
+        tps = self.token_count / elapsed
+        print(f"\n[Done] TPS: {tps:.2f}\n")
+        
+        # Save metrics for graphing
+        import json
+        metrics = {
+            "device": os.uname().machine,
+            "model": "opt",
+            "mode": self.mode_name,
+            "avg_latency": 1.0 / tps if tps > 0 else 0, # Latency per token
+            "tps": tps,
+            "timestamp": time.ctime()
+        }
+        with open(f"edge_metrics_{self.mode_name}.json", "w") as f:
+            json.dump(metrics, f, indent=4)
 
 def chat(args):
     global CACHE_PATH, FFN_BIN_PATH, LAYERS_DIR, PREDICTOR_BIN_PATH

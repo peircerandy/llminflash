@@ -139,26 +139,36 @@ To create a professional comparison for your presentation:
    ```
 
 3. **Bring the results back to your LAPTOP:**
-   Copy the telemetry and metrics into the `edge_results/` folder on your laptop:
+   Copy the telemetry, metrics, and **the input image** into the `edge_results/` folder on your laptop:
    ```bash
    # From your laptop terminal:
-   scp rpi@192.168.1.x:~/edge_deployment/edge_metrics.json ./edge_results/pi_metrics.json
-   scp rpi@192.168.1.x:~/edge_deployment/edge_output_cls_token.npy ./edge_results/pi_token.npy
+   # 1. Metrics and Tokens
+   scp rpi@192.168.1.x:~/edge_deployment/*_metrics_*.json ./edge_results/
+   scp rpi@192.168.1.x:~/edge_deployment/*_output_*.npy ./edge_results/
+
+   # 2. The input image (REQUIRED for Visual Proof)
+   # If you used the default:
+   scp rpi@192.168.1.x:~/edge_deployment/sample_satellite.png ./edge_results/
+   # If you used a custom camera photo, name it with the device prefix:
+   scp rpi@192.168.1.x:~/edge_deployment/test_capture.jpg ./edge_results/pi4_test_capture.jpg
    ```
 
 4. **Analyze on your laptop:**
    
-   **To Classify:**
+   **To Classify a Specific Token:**
    ```bash
-   python classify_edge_result.py edge_results/pi_token.npy
+   python classify_edge_result.py edge_results/pi4_output_cls_token.npy
    ```
 
-   **To Graph Latency (Laptop vs Pi vs Phone):**
+   **To Graph Multi-Model Results:**
    ```bash
-   # Make sure you also have laptop_metrics.json in there!
    python graph_edge_results.py
    ```
-   This generates `edge_performance_comparison.png`.
+   This generates:
+   - `edge_latency_clay.png`
+   - `edge_latency_opt.png`
+   - `edge_fidelity_proof.png`
+   - `edge_visual_proof_pi4.png` (Reconstructs the edge prediction visually!)
 
 **Test Causal LLM:**
 ```bash

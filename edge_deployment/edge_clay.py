@@ -204,9 +204,11 @@ def main():
     import json
     metrics = {
         "device": os.uname().machine,
+        "model": "clay",
         "mode": args.mode,
         "avg_latency": avg_lat,
         "input_img_kb": input_size / 1024,
+        "source_image": args.image,
         "telemetry_kb": (heatmap.nbytes + cls_token.nbytes) / 1024,
         "data_reduction_ratio": reduction,
         "timestamp": time.ctime()
