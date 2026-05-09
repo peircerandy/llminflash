@@ -1,0 +1,11 @@
+{
+    "device": "x86_64",
+    "model": "clay",
+    "mode": "predictor",
+    "avg_latency": 24.491665029525755,
+    "input_img_kb": 10.8037109375,
+    "source_image": "sample_satellite.png",
+    "telemetry_kb": 7.0625,
+    "data_reduction_ratio": 3.5277423469387754,
+    "timestamp": "Sat May  9 08:57:10 2026"
+}

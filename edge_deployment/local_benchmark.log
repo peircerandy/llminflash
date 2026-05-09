@@ -1,0 +1,54 @@
+edge_benchmark.sh: line 69:  3174 Done                    echo "What is the capital of France?"
+      3175 Killed                  | OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python chat.py --mode draft $LLM_ARGS
+edge_benchmark.sh: line 69:  3215 Done                    echo "What is the capital of France?"
+      3216 Killed                  | OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python chat.py --mode predictor $LLM_ARGS
+edge_benchmark.sh: line 69:  3259 Done                    echo "What is the capital of France?"
+      3260 Killed                  | OPENBLAS_VERBOSE=0 OMP_WAIT_POLICY=PASSIVE python chat.py --mode naive $LLM_ARGS
+===============================================
+   STARTING EDGE DEPLOYMENT BENCHMARKS        
+===============================================
+
+>>> RUNNING LLM BENCHMARKS (OPT-6.7b) <<<
+Using GCP Trained Predictors...
+
+[1/3] LLM DRAFT MODE (Fastest)...
+--- PATH VERIFICATION ---
+  FFN Binary: opt_6_7b_bundled_ffn.bin
+  Predictor:  opt_gcp_predictors.bin
+  Layers Dir: ./opt_6_7b_layers
+  HF Cache:   ./hf_cache
+--------------------------
+
+Loading metadata directly from local cache folder: ./hf_cache
+Materializing Lean Model Structure (FP16)...
+✅ Lean structure ready and zero-initialized.
+Loading global resident layers...
+
+[2/3] LLM PREDICTOR MODE (Our Contribution)...
+--- PATH VERIFICATION ---
+  FFN Binary: opt_6_7b_bundled_ffn.bin
+  Predictor:  opt_gcp_predictors.bin
+  Layers Dir: ./opt_6_7b_layers
+  HF Cache:   ./hf_cache
+--------------------------
+
+Loading metadata directly from local cache folder: ./hf_cache
+Materializing Lean Model Structure (FP16)...
+✅ Lean structure ready and zero-initialized.
+Loading global resident layers...
+
+[3/3] LLM NAIVE MODE (Dense Baseline)...
+--- PATH VERIFICATION ---
+  FFN Binary: opt_6_7b_bundled_ffn.bin
+  Predictor:  opt_gcp_predictors.bin
+  Layers Dir: ./opt_6_7b_layers
+  HF Cache:   ./hf_cache
+--------------------------
+
+Loading metadata directly from local cache folder: ./hf_cache
+Materializing Lean Model Structure (FP16)...
+
+===============================================
+   BENCHMARKS COMPLETE                        
+===============================================
+Next: Use 'bash rename_results.sh <device>' then 'scp' back to your laptop.
