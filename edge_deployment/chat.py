@@ -1,6 +1,6 @@
 """
 chat.py: The primary Python orchestration layer for the local chatbot.
-Optimized for 8GB RAM systems using Lean Materialization and Layer-wise Loading.
+Optimized for 8GB RAM systems using Layer-by-Layer Materialization.
 """
 
 import os
@@ -49,6 +49,9 @@ lib.execute_ffn_layer.argtypes = [
 lib.destroy_engine.argtypes = [ctypes.c_void_p]
 
 class ZeroModule(nn.Module):
+    def __init__(self, out_features=16384):
+        super().__init__()
+        self.out_features = out_features
     def forward(self, x): return torch.zeros_like(x)
 
 class FlashFFN(nn.Module):
@@ -105,10 +108,31 @@ class StreamAndTimer:
     def stop(self):
         elapsed = time.time() - self.start_time
         print(f"\n[Done] TPS: {self.token_count / elapsed:.2f}\n")
-        # Save metrics for graphing
         import json
         metrics = {"device": os.uname().machine, "model": "opt", "mode": self.mode_name, "avg_latency": 1.0 / (self.token_count / elapsed) if self.token_count > 0 else 0, "tps": self.token_count / elapsed, "timestamp": time.ctime()}
         with open(f"edge_metrics_{self.mode_name}.json", "w") as f: json.dump(metrics, f, indent=4)
+
+def suffix_load(target_module, state_dict, name_hint=""):
+    """Tries to load weights by matching suffixes and POPS them from state_dict to save RAM."""
+    loaded_count = 0
+    suffix_to_param = {}
+    for name, param in target_module.named_parameters():
+        suffix = ".".join(name.split('.')[-2:])
+        if suffix not in suffix_to_param: suffix_to_param[suffix] = []
+        suffix_to_param[suffix].append((name, param))
+    
+    with torch.no_grad():
+        for k_ckpt in list(state_dict.keys()):
+            suffix_ckpt = ".".join(k_ckpt.split('.')[-2:])
+            if suffix_ckpt in suffix_to_param:
+                for name_target, p_target in suffix_to_param[suffix_ckpt]:
+                    if p_target.shape == state_dict[k_ckpt].shape:
+                        p_target.copy_(state_dict[k_ckpt].half())
+                        state_dict.pop(k_ckpt) 
+                        loaded_count += 1
+                        break
+    if loaded_count > 0:
+        print(f"  -> {name_hint}: Loaded {loaded_count} layers.", flush=True)
 
 def chat(args):
     global CACHE_PATH, FFN_BIN_PATH, LAYERS_DIR, PREDICTOR_BIN_PATH
@@ -140,67 +164,66 @@ def chat(args):
             lib.set_predictor_layer_info(engine_ptr, i, meta['rank'], ctypes.c_size_t(offset))
             offset += (meta['hidden_size'] * meta['rank']) + (meta['ffn_dim'] * meta['rank'])
     lib.set_engine_config(engine_ptr, args.top_k, args.threshold, args.window)
-    mode_int = {"predictor": 0, "oracle": 2, "naive": 1, "draft": 0}[args.mode]
     
+    mode_int = {"predictor": 0, "oracle": 2, "naive": 1, "draft": 0}[args.mode]
     config = AutoConfig.from_pretrained(load_path, cache_dir=CACHE_PATH, local_files_only=True)
     
     print("Materializing Lean Model Structure (FP16)...", flush=True)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
-        # Surgical Lean Materialization: Swap FFN for Identity BEFORE materialize to save 8GB RAM
+        # PRE-MATERIALIZATION SWAP: Save 8GB RAM by replacing heavy FFNs on META device
         for i in range(NUM_LAYERS):
             layer = model.model.decoder.layers[i]
-            layer.fc1 = nn.Identity(); layer.fc2 = nn.Identity(); layer.activation_fn = nn.Identity()
+            if args.mode == "draft" and i % 4 == 0:
+                layer.fc1 = ZeroModule(16384)
+            else:
+                layer.fc1 = nn.Identity() 
+            layer.fc2 = nn.Identity()
+            layer.activation_fn = nn.Identity()
 
-    model.to_empty(device="cpu")
-    print("✅ Lean structure ready.", flush=True)
+    # SURGICAL LAYER-BY-LAYER MATERIALIZATION
+    print("Materializing resident components...", flush=True)
+    model.model.decoder.embed_tokens.to_empty(device="cpu")
+    model.model.decoder.embed_positions.to_empty(device="cpu")
+    model.model.decoder.final_layer_norm.to_empty(device="cpu")
+    model.lm_head.to_empty(device="cpu")
     
-    def suffix_load(target_module, state_dict, name_hint=""):
-        target_sd = target_module.state_dict()
-        clean_sd = {}
-        loaded_count = 0
-        suffix_map = {}
-        for k in target_sd.keys():
-            suffix = ".".join(k.split('.')[-2:])
-            if suffix not in suffix_map: suffix_map[suffix] = []
-            suffix_map[suffix].append(k)
-        for k_ckpt, v in state_dict.items():
-            suffix_ckpt = ".".join(k_ckpt.split('.')[-2:])
-            if suffix_ckpt in suffix_map:
-                for k_target in suffix_map[suffix_ckpt]:
-                    if target_sd[k_target].shape == v.shape:
-                        clean_sd[k_target] = v.half(); loaded_count += 1; break
-        target_module.load_state_dict(clean_sd, strict=False)
-        print(f"  -> {name_hint}: Loaded {loaded_count} layers.", flush=True)
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.device.type != 'meta': p.zero_()
 
     print("Loading global resident layers...", flush=True)
-    globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
+    globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu", mmap=True)
     suffix_load(model, globals_sd, "Globals")
+    del globals_sd; gc.collect()
     
-    # CRITICAL: Tie LM Head to Embeddings (Brain fix)
     model.lm_head.weight = model.model.decoder.embed_tokens.weight
-    print("✅ LM Head tied to Embeddings.", flush=True)
     
     print(f"Loading layers and patching ({args.mode.upper()})...", flush=True)
     for i in range(NUM_LAYERS):
-        if i % 4 == 0: print(f"  -> Patching FlashFFN: Decoder Block {i}/{NUM_LAYERS}...", flush=True)
-        layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu")
+        if i % 4 == 0: print(f"  -> Decoder Block {i}/{NUM_LAYERS}...", flush=True)
         layer = model.model.decoder.layers[i]
+        layer.self_attn.to_empty(device="cpu")
+        layer.self_attn_layer_norm.to_empty(device="cpu")
+        layer.final_layer_norm.to_empty(device="cpu")
         
-        if args.mode == "draft" and i % 4 == 0:
-            layer.fc1 = ZeroModule()
-        else:
-            suffix_load(layer, layer_sd, f"Block {i}")
+        with torch.no_grad():
+            for p in layer.parameters(): 
+                if p.device.type != 'meta': p.zero_()
+
+        layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu", mmap=True)
+        suffix_load(layer, layer_sd, f"Block {i}")
+        
+        if not (args.mode == "draft" and i % 4 == 0):
             fc1_b = None; fc2_b = None
             for k, v in layer_sd.items():
                 if "fc1.bias" in k: fc1_b = v.float().cpu().contiguous()
                 if "fc2.bias" in k: fc2_b = v.float().cpu().contiguous()
             layer.fc1 = FlashFFN(i, engine_ptr, fc1_b, fc2_b, mode_int)
+        
         del layer_sd; gc.collect()
             
-    print("Finalizing model materialization...", flush=True)
-    for p in model.parameters():
-        if torch.isnan(p).any(): p.data.zero_()
+    print("✅ Lean model ready.", flush=True)
     model.eval()
     
     timer = StreamAndTimer(tokenizer, args.mode)
@@ -220,9 +243,6 @@ def chat(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--mode', choices=['predictor', 'oracle', 'naive', 'draft'], default='predictor')
-    p.add_argument('--predictor', type=str)
-    p.add_argument('--ffn_bin', type=str)
-    p.add_argument('--layers', type=str)
-    p.add_argument('--cache', type=str)
+    p.add_argument('--predictor', type=str); p.add_argument('--ffn_bin', type=str); p.add_argument('--layers', type=str); p.add_argument('--cache', type=str)
     p.add_argument('--top_k', type=int, default=1024); p.add_argument('--threshold', type=float, default=0.2); p.add_argument('--window', type=int, default=5)
     chat(p.parse_args())
