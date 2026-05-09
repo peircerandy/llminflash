@@ -50,17 +50,28 @@ Copy these from your main workstation using `scp` or `rsync`:
 *   `opt_6_7b_bundled_ffn.bin` (From `/mnt/wsl/PHYSICALDRIVE0p3/`)
 *   `opt_gcp_predictors.bin` (GCP trained version - from `/mnt/wsl/PHYSICALDRIVE0p3/`)
 *   `opt_gcp_predictors.json` (Required metadata - from `/mnt/wsl/PHYSICALDRIVE0p3/`)
-
 ### 4. Running Edge Inference
 
 You can run individual tests or the full automated suite.
 
 **Run Automated Suite:**
 ```bash
+# Run Clay benchmarks only (Default)
 bash edge_benchmark.sh
+
+# Run LLM benchmarks only
+bash edge_benchmark.sh --llm
+
+# Run BOTH Clay and LLM benchmarks
+bash edge_benchmark.sh --all
+
+# Run benchmarks using GCP predictors (for LLM)
+bash edge_benchmark.sh --llm --gcp
 ```
 
 **Individual Modes:**
+...
+
 ```bash
 # Predictor (Standard LLM-in-a-Flash)
 python edge_clay.py --mode predictor
