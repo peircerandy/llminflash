@@ -50,10 +50,12 @@ fi
 if [ "$RUN_LLM" = true ] ; then
     echo -e "\n>>> RUNNING LLM BENCHMARKS (OPT-6.7b) <<<"
     
-    LLM_ARGS=""
+    # Ensure we use the bundled local cache for offline stability
+    LLM_ARGS="--cache ./hf_cache"
+    
     if [ "$USE_GCP" = true ] ; then
         echo "Using GCP Trained Predictors..."
-        LLM_ARGS="--predictor opt_gcp_predictors.bin --layers ./opt_6_7b_layers --ffn_bin opt_6_7b_bundled_ffn.bin"
+        LLM_ARGS="$LLM_ARGS --predictor opt_gcp_predictors.bin --layers ./opt_6_7b_layers --ffn_bin opt_6_7b_bundled_ffn.bin"
     fi
 
     echo -e "\n[1/3] LLM DRAFT MODE (Fastest)..."
