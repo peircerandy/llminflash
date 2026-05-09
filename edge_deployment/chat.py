@@ -156,6 +156,13 @@ def chat(args):
     if args.layers: LAYERS_DIR = args.layers
     if args.predictor: PREDICTOR_BIN_PATH = args.predictor.encode()
 
+    print(f"--- PATH VERIFICATION ---")
+    print(f"  FFN Binary: {FFN_BIN_PATH.decode()}")
+    print(f"  Predictor:  {PREDICTOR_BIN_PATH.decode()}")
+    print(f"  Layers Dir: {LAYERS_DIR}")
+    print(f"  HF Cache:   {CACHE_PATH}")
+    print(f"--------------------------\n")
+
     print(f"Initializing {args.mode.upper()} Mode...")
     
     # --- OFFLINE LOADING FIX ---
@@ -195,27 +202,42 @@ def chat(args):
         print("✅ Structure ready.", flush=True)
         
         def smart_load(target_module, state_dict, name_hint=""):
-            """Tries to load weights even if prefixes (model. or decoder.) are slightly different."""
+            """Tries to load weights by matching the suffix of keys (e.g., self_attn.k_proj.weight)."""
             target_sd = target_module.state_dict()
             clean_sd = {}
             loaded_count = 0
             
-            # Try to match keys by stripping common prefixes
+            # Create a map of suffixes to target keys
+            # e.g., "self_attn.k_proj.weight" -> "model.decoder.layers.0.self_attn.k_proj.weight"
+            suffix_map = {}
+            for k in target_sd.keys():
+                # We use the last 2 parts of the key for matching (e.g., k_proj.weight)
+                # or 3 parts for deeper nesting.
+                parts = k.split('.')
+                suffix = ".".join(parts[-2:]) 
+                if suffix not in suffix_map: suffix_map[suffix] = []
+                suffix_map[suffix].append(k)
+            
             for k_ckpt, v in state_dict.items():
-                # Potential keys: 'model.decoder.embed_tokens.weight', 'decoder.embed_tokens.weight'
-                # Target keys: 'model.decoder.embed_tokens.weight' or 'decoder.embed_tokens.weight'
+                parts_ckpt = k_ckpt.split('.')
+                suffix_ckpt = ".".join(parts_ckpt[-2:])
                 
-                match_key = None
-                if k_ckpt in target_sd: match_key = k_ckpt
-                elif k_ckpt.replace("model.", "") in target_sd: match_key = k_ckpt.replace("model.", "")
-                elif f"model.{k_ckpt}" in target_sd: match_key = f"model.{k_ckpt}"
-                
-                if match_key and target_sd[match_key].shape == v.shape:
-                    clean_sd[match_key] = v.half()
-                    loaded_count += 1
+                if suffix_ckpt in suffix_map:
+                    # Find the best match by checking the full key similarity
+                    best_match = None
+                    for k_target in suffix_map[suffix_ckpt]:
+                        if k_target.endswith(suffix_ckpt):
+                            # Check if the shape matches
+                            if target_sd[k_target].shape == v.shape:
+                                best_match = k_target
+                                break
+                    
+                    if best_match:
+                        clean_sd[best_match] = v.half()
+                        loaded_count += 1
             
             msg = target_module.load_state_dict(clean_sd, strict=False)
-            print(f"  -> {name_hint}: Loaded {loaded_count} layers. Missing: {len(msg.missing_keys)}", flush=True)
+            print(f"  -> {name_hint}: Loaded {loaded_count} layers. (Missing: {len(msg.missing_keys)} if strict)", flush=True)
             return msg
 
         print("Loading global resident layers (Embeddings/Norms/Head)...", flush=True)
