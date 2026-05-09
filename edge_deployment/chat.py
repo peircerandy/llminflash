@@ -146,14 +146,22 @@ def chat(args):
     if args.predictor: PREDICTOR_BIN_PATH = args.predictor.encode()
 
     print(f"Initializing {args.mode.upper()} Mode...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH, local_files_only=True)
+    
+    # --- OFFLINE LOADING FIX ---
+    # We must pass the FOLDER path, not the HUB ID, if we want to load from save_pretrained files.
+    load_path = MODEL_ID
+    if os.path.exists(os.path.join(CACHE_PATH, "config.json")):
+        load_path = CACHE_PATH
+        print(f"Loading metadata directly from local cache folder: {CACHE_PATH}")
+
+    tokenizer = AutoTokenizer.from_pretrained(load_path, cache_dir=CACHE_PATH, local_files_only=True)
     engine_ptr = None; assistant_model = None
 
     if args.mode == "quantized":
         q_config = BitsAndBytesConfig(load_in_4bit=True, llm_int8_enable_fp32_cpu_offload=True)
-        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, quantization_config=q_config, device_map="auto", cache_dir=CACHE_PATH, local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(load_path, quantization_config=q_config, device_map="auto", cache_dir=CACHE_PATH, local_files_only=True)
     else:
-        pred_path = args.predictor.encode() if args.predictor else PREDICTOR_BIN_PATH
+        pred_path = PREDICTOR_BIN_PATH
         engine_ptr = lib.init_engine(FFN_BIN_PATH, pred_path, ctypes.c_size_t(HIDDEN_SIZE), ctypes.c_size_t(16384), ctypes.c_size_t(NUM_LAYERS), ctypes.c_int(0))
         meta = load_predictor_metadata(pred_path)
         if meta:
@@ -166,7 +174,7 @@ def chat(args):
         # Engine Modes: 0=Predictor, 1=Naive, 2=Oracle
         mode_int = {"predictor": 0, "oracle": 2, "naive": 1, "draft": 0}[args.mode]
         
-        config = AutoConfig.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH, local_files_only=True)
+        config = AutoConfig.from_pretrained(load_path, cache_dir=CACHE_PATH, local_files_only=True)
         with init_empty_weights(): model = AutoModelForCausalLM.from_config(config)
         globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
         for k, v in globals_sd.items():
@@ -179,7 +187,6 @@ def chat(args):
             layer = model.model.decoder.layers[i]
             
             if args.mode == "draft" and i % 4 == 0:
-                # Layer Skipping for LLM Draft mode
                 layer.fc1 = nn.Identity()
                 layer.fc2 = nn.Identity()
                 layer.activation_fn = nn.Identity()
