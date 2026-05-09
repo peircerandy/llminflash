@@ -46,9 +46,10 @@ Copy these from your main workstation using `scp` or `rsync`:
 *   `Clay_predictors.bin`
 
 **For the Causal LLM (OPT-6.7b):**
-*   `opt_6_7b_resident.pt` (Contains only Attention and Norm layers)
-*   `opt_bundled_ffn.bin`
-*   `opt_predictors.bin`
+*   `opt_6_7b_layers/` directory (From `/mnt/wsl/PHYSICALDRIVE0p3/`)
+*   `opt_6_7b_bundled_ffn.bin` (From `/mnt/wsl/PHYSICALDRIVE0p3/`)
+*   `opt_gcp_predictors.bin` (GCP trained version - from `/mnt/wsl/PHYSICALDRIVE0p3/`)
+*   `opt_gcp_predictors.json` (Required metadata - from `/mnt/wsl/PHYSICALDRIVE0p3/`)
 
 ### 4. Running Edge Inference
 
@@ -150,5 +151,9 @@ To create a professional comparison for your presentation:
 
 **Test Causal LLM:**
 ```bash
+# Run with standard predictors
 python chat.py --mode predictor
+
+# Run with GCP predictors (Recommended for best accuracy)
+python chat.py --mode predictor --predictor opt_gcp_predictors.bin --layers ./opt_6_7b_layers --ffn_bin opt_6_7b_bundled_ffn.bin
 ```

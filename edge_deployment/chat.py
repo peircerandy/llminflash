@@ -27,15 +27,15 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Configuration
+# Configuration (Defaults for Edge)
 MODEL_ID = "facebook/opt-6.7b"
-CACHE_PATH = "/mnt/wsl/PHYSICALDRIVE0p3/hf_cache"
-FFN_BIN_PATH = b"/mnt/wsl/PHYSICALDRIVE0p3/opt_6_7b_bundled_ffn.bin"
-LAYERS_DIR = "/mnt/wsl/PHYSICALDRIVE0p3/opt_6_7b_layers"
+CACHE_PATH = "./hf_cache"
+FFN_BIN_PATH = b"./opt_6_7b_bundled_ffn.bin"
+LAYERS_DIR = "./opt_6_7b_layers"
 HIDDEN_SIZE = 4096
 NUM_LAYERS = 32
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-PREDICTOR_BIN_PATH = b"/mnt/wsl/PHYSICALDRIVE0p3/opt_6_7b_predictors.bin"
+DEVICE = "cpu" # Default to CPU for Pi/Phone
+PREDICTOR_BIN_PATH = b"./opt_6_7b_predictors.bin"
 
 # --- 1. C++ Engine Bindings ---
 lib = ctypes.CDLL(os.path.abspath("./libengine.so"))
@@ -125,6 +125,12 @@ class StreamAndTimer:
         print(f"\n[Done] TPS: {self.token_count / elapsed:.2f}\n")
 
 def chat(args):
+    global CACHE_PATH, FFN_BIN_PATH, LAYERS_DIR, PREDICTOR_BIN_PATH
+    if args.cache: CACHE_PATH = args.cache
+    if args.ffn_bin: FFN_BIN_PATH = args.ffn_bin.encode()
+    if args.layers: LAYERS_DIR = args.layers
+    if args.predictor: PREDICTOR_BIN_PATH = args.predictor.encode()
+
     print(f"Initializing {args.mode.upper()} Mode...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH, local_files_only=True)
     engine_ptr = None; assistant_model = None
@@ -201,6 +207,9 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Interactive Chat CLI for LLM-in-a-Flash.")
     p.add_argument('--mode', choices=['predictor', 'oracle', 'naive', 'quantized', 'speculative_custom', 'draft'], default='predictor', help="Inference mode")
     p.add_argument('--predictor', type=str, help="Path to .bin predictor")
+    p.add_argument('--ffn_bin', type=str, help="Path to bundled FFN binary")
+    p.add_argument('--layers', type=str, help="Path to directory containing resident layers (.pt files)")
+    p.add_argument('--cache', type=str, help="Path to HuggingFace cache")
     p.add_argument('--top_k', type=int, default=1024)
     p.add_argument('--threshold', type=float, default=0.2)
     p.add_argument('--window', type=int, default=5)
