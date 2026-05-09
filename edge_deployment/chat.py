@@ -166,7 +166,7 @@ def chat(args):
         # Engine Modes: 0=Predictor, 1=Naive, 2=Oracle
         mode_int = {"predictor": 0, "oracle": 2, "naive": 1, "draft": 0}[args.mode]
         
-        config = AutoConfig.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH)
+        config = AutoConfig.from_pretrained(MODEL_ID, cache_dir=CACHE_PATH, local_files_only=True)
         with init_empty_weights(): model = AutoModelForCausalLM.from_config(config)
         globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
         for k, v in globals_sd.items():
