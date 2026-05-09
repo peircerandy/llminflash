@@ -1,6 +1,6 @@
 """
 chat.py: The primary Python orchestration layer for the local chatbot.
-Optimized for 8GB RAM systems using Layer-by-Layer Materialization.
+Optimized for 8GB RAM systems using Speculative Decoding and Layer-wise Loading.
 """
 
 import os
@@ -15,8 +15,9 @@ import threading
 import gc
 import argparse
 import json
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, StoppingCriteria, StoppingCriteriaList
 from accelerate import init_empty_weights
+from accelerate.utils import set_module_tensor_to_device
 
 # --- 0. Setup & Silence ---
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -28,17 +29,18 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # Configuration
 MODEL_ID = "facebook/opt-6.7b"
+ASST_ID = "facebook/opt-125m"
 CACHE_PATH = "./hf_cache"
 FFN_BIN_PATH = b"./opt_6_7b_bundled_ffn.bin"
 LAYERS_DIR = "./opt_6_7b_layers"
 HIDDEN_SIZE = 4096
 NUM_LAYERS = 32
-DEVICE = "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 PREDICTOR_BIN_PATH = b"./opt_6_7b_predictors.bin"
 
 # --- 1. C++ Engine Bindings ---
 lib = ctypes.CDLL(os.path.abspath("./libengine.so"))
-lib.init_engine.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
+lib.init_engine.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int, ctypes.c_int]
 lib.init_engine.restype = ctypes.c_void_p
 lib.set_engine_config.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_float, ctypes.c_int]
 lib.set_predictor_layer_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_size_t]
@@ -48,18 +50,14 @@ lib.execute_ffn_layer.argtypes = [
 ]
 lib.destroy_engine.argtypes = [ctypes.c_void_p]
 
-class ZeroModule(nn.Module):
-    def __init__(self, out_features=16384):
-        super().__init__()
-        self.out_features = out_features
-    def forward(self, x): return torch.zeros_like(x)
-
 class FlashFFN(nn.Module):
     def __init__(self, layer_idx, engine_ptr, fc1_bias, fc2_bias, mode_int):
         super().__init__()
         self.layer_idx = layer_idx
         self.engine_ptr = engine_ptr
         self.mode_int = mode_int
+        self.fc1_bias_ref = fc1_bias
+        self.fc2_bias_ref = fc2_bias
         self.fc1_bias_c = ctypes.cast(fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float)) if fc1_bias is not None else None
         self.fc2_bias = fc2_bias.half() if fc2_bias is not None else torch.zeros(HIDDEN_SIZE).half()
 
@@ -71,7 +69,11 @@ class FlashFFN(nn.Module):
             ctypes.cast(flat_x.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             ctypes.cast(out_cpu.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             flat_x.shape[0], self.fc1_bias_c, self.mode_int)
-        return out_cpu.to(x.device, dtype=torch.float16).view(*orig_shape) + self.fc2_bias
+        
+        res = out_cpu.to(x.device, dtype=torch.float16).view(*orig_shape) + self.fc2_bias
+        if torch.isnan(res).any():
+            res = torch.nan_to_num(res)
+        return res
 
 def load_predictor_metadata(bin_path):
     if not bin_path: return None
@@ -81,58 +83,74 @@ def load_predictor_metadata(bin_path):
         with open(meta_path, "r") as f: return json.load(f)
     return None
 
+class WhitespaceStoppingCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, max_whitespace=5):
+        self.tokenizer = tokenizer
+        self.max_whitespace = max_whitespace
+        self.whitespace_count = 0
+
+    def __call__(self, input_ids, scores, **kwargs):
+        last_token_id = input_ids[0, -1].item()
+        last_token_text = self.tokenizer.decode([last_token_id])
+        if last_token_text.isspace() or last_token_text == "":
+            self.whitespace_count += 1
+        else:
+            self.whitespace_count = 0
+        return self.whitespace_count >= self.max_whitespace
+
 class StreamAndTimer:
     def __init__(self, tokenizer, mode_name):
         self.tokenizer = tokenizer
         self.mode_name = mode_name
         self.token_count = 0
         self.start_time = None
-        self.full_text = ""
+        self.tokens = []
         self.print_len = 0
+        self.done_printed = False
     
     def start(self):
         self.token_count = 0
-        self.start_time = time.time()
-        self.full_text = ""
+        self.start_time = None 
+        self.tokens = []
         self.print_len = 0
+        self.done_printed = False
         print(f"ASSISTANT [{self.mode_name.upper()}]: ", end="", flush=True)
 
     def put(self, value):
         if torch.is_tensor(value): value = value.view(-1).tolist()
         elif isinstance(value, int): value = [value]
+        
+        # Timing starts on the VERY FIRST token produced by generate()
+        if self.start_time is None:
+            self.start_time = time.time()
+            
         self.token_count += len(value)
-        self.full_text = self.tokenizer.decode(self.tokenizer.encode(self.full_text) + value, skip_special_tokens=True)
-        print(self.full_text[self.print_len:], end="", flush=True)
-        self.print_len = len(self.full_text)
+        self.tokens.extend(value)
+        
+        full_text = self.tokenizer.decode(self.tokens, skip_special_tokens=True)
+        print(full_text[self.print_len:], end="", flush=True)
+        self.print_len = len(full_text)
     
-    def stop(self):
-        elapsed = time.time() - self.start_time
-        print(f"\n[Done] TPS: {self.token_count / elapsed:.2f}\n")
-        import json
-        metrics = {"device": os.uname().machine, "model": "opt", "mode": self.mode_name, "avg_latency": 1.0 / (self.token_count / elapsed) if self.token_count > 0 else 0, "tps": self.token_count / elapsed, "timestamp": time.ctime()}
-        with open(f"edge_metrics_{self.mode_name}.json", "w") as f: json.dump(metrics, f, indent=4)
+    def end(self):
+        self.stop()
 
-def suffix_load(target_module, state_dict, name_hint=""):
-    """Tries to load weights by matching suffixes and POPS them from state_dict to save RAM."""
-    loaded_count = 0
-    suffix_to_param = {}
-    for name, param in target_module.named_parameters():
-        suffix = ".".join(name.split('.')[-2:])
-        if suffix not in suffix_to_param: suffix_to_param[suffix] = []
-        suffix_to_param[suffix].append((name, param))
-    
-    with torch.no_grad():
-        for k_ckpt in list(state_dict.keys()):
-            suffix_ckpt = ".".join(k_ckpt.split('.')[-2:])
-            if suffix_ckpt in suffix_to_param:
-                for name_target, p_target in suffix_to_param[suffix_ckpt]:
-                    if p_target.shape == state_dict[k_ckpt].shape:
-                        p_target.copy_(state_dict[k_ckpt].half())
-                        state_dict.pop(k_ckpt) 
-                        loaded_count += 1
-                        break
-    if loaded_count > 0:
-        print(f"  -> {name_hint}: Loaded {loaded_count} layers.", flush=True)
+    def stop(self):
+        if self.done_printed or self.start_time is None: return
+        self.done_printed = True
+        elapsed = time.time() - self.start_time
+        tps = self.token_count / elapsed if elapsed > 0.001 else 0
+        print(f"\n[Done] Tokens: {self.token_count} | Elapsed: {elapsed:.2f}s | TPS: {tps:.2f}\n")
+        
+        metrics = {
+            "device": os.uname().machine,
+            "model": "opt",
+            "mode": self.mode_name,
+            "avg_latency": 1.0 / tps if tps > 0 else 0,
+            "tps": tps,
+            "timestamp": time.ctime()
+        }
+        with open(f"edge_metrics_{self.mode_name}.json", "w") as f:
+            json.dump(metrics, f, indent=4)
 
 def chat(args):
     global CACHE_PATH, FFN_BIN_PATH, LAYERS_DIR, PREDICTOR_BIN_PATH
@@ -149,17 +167,11 @@ def chat(args):
     print(f"--------------------------\n")
 
     load_path = MODEL_ID
-    if os.path.exists(os.path.join(CACHE_PATH, "config.json")):
-        load_path = CACHE_PATH
-        print(f"Loading metadata directly from local cache folder: {CACHE_PATH}")
-
+    if os.path.exists(os.path.join(CACHE_PATH, "config.json")): load_path = CACHE_PATH
     tokenizer = AutoTokenizer.from_pretrained(load_path, cache_dir=CACHE_PATH, local_files_only=True)
     
-    pred_path = PREDICTOR_BIN_PATH
-    # Dynamic Cache Size: Default to 1024 to fit on 8GB systems
-    # 32 layers * 1024 neurons * 8193 vals * 4 bytes = 1.05 GB C++ overhead
-    engine_ptr = lib.init_engine(FFN_BIN_PATH, pred_path, ctypes.c_size_t(HIDDEN_SIZE), ctypes.c_size_t(16384), ctypes.c_size_t(NUM_LAYERS), ctypes.c_int(0), ctypes.c_int(args.max_cache))
-    meta = load_predictor_metadata(pred_path)
+    engine_ptr = lib.init_engine(FFN_BIN_PATH, PREDICTOR_BIN_PATH, ctypes.c_size_t(HIDDEN_SIZE), ctypes.c_size_t(16384), ctypes.c_size_t(NUM_LAYERS), ctypes.c_int(0), ctypes.c_int(args.max_cache))
+    meta = load_predictor_metadata(PREDICTOR_BIN_PATH)
     if meta:
         offset = 0
         for i in range(NUM_LAYERS):
@@ -173,68 +185,67 @@ def chat(args):
     print("Materializing Lean Model Structure (FP16)...", flush=True)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
-        # PRE-MATERIALIZATION SWAP: Save 8GB RAM by replacing heavy FFNs on META device
-        for i in range(NUM_LAYERS):
-            layer = model.model.decoder.layers[i]
-            if args.mode == "draft" and i % 4 == 0:
-                layer.fc1 = ZeroModule(16384)
-            else:
-                layer.fc1 = nn.Identity() 
-            layer.fc2 = nn.Identity()
-            layer.activation_fn = nn.Identity()
-
-    # SURGICAL LAYER-BY-LAYER MATERIALIZATION
-    print("Materializing resident components...", flush=True)
-    model.model.decoder.embed_tokens.to_empty(device="cpu")
-    model.model.decoder.embed_positions.to_empty(device="cpu")
-    model.model.decoder.final_layer_norm.to_empty(device="cpu")
-    model.lm_head.to_empty(device="cpu")
-    
-    with torch.no_grad():
-        for p in model.parameters():
-            if p.device.type != 'meta': p.zero_()
 
     print("Loading global resident layers...", flush=True)
-    globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu", mmap=True)
-    suffix_load(model, globals_sd, "Globals")
+    globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
+    for k, v in globals_sd.items():
+        target = model.model if k.startswith("decoder.") else model
+        set_module_tensor_to_device(target, k, DEVICE, value=v, dtype=torch.float16)
     del globals_sd; gc.collect()
-    
-    model.lm_head.weight = model.model.decoder.embed_tokens.weight
     
     print(f"Loading layers and patching ({args.mode.upper()})...", flush=True)
     for i in range(NUM_LAYERS):
         if i % 4 == 0: print(f"  -> Decoder Block {i}/{NUM_LAYERS}...", flush=True)
+        layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu")
         layer = model.model.decoder.layers[i]
-        layer.self_attn.to_empty(device="cpu")
-        layer.self_attn_layer_norm.to_empty(device="cpu")
-        layer.final_layer_norm.to_empty(device="cpu")
-        
-        with torch.no_grad():
-            for p in layer.parameters(): 
-                if p.device.type != 'meta': p.zero_()
-
-        layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu", mmap=True)
-        suffix_load(layer, layer_sd, f"Block {i}")
-        
-        if not (args.mode == "draft" and i % 4 == 0):
-            fc1_b = None; fc2_b = None
-            for k, v in layer_sd.items():
-                if "fc1.bias" in k: fc1_b = v.float().cpu().contiguous()
-                if "fc2.bias" in k: fc2_b = v.float().cpu().contiguous()
-            layer.fc1 = FlashFFN(i, engine_ptr, fc1_b, fc2_b, mode_int)
-        
+        for k, v in layer_sd.items():
+            if "fc" in k: continue
+            clean_k = k.replace(f"decoder.layers.{i}.", "")
+            set_module_tensor_to_device(layer, clean_k, DEVICE, value=v, dtype=torch.float16)
+        fc1_b = layer_sd[f"decoder.layers.{i}.fc1.bias"].float().cpu().contiguous()
+        fc2_b = layer_sd[f"decoder.layers.{i}.fc2.bias"].float().cpu().contiguous()
+        layer.fc1 = FlashFFN(i, engine_ptr, fc1_b, fc2_b, mode_int)
+        layer.fc2 = nn.Identity(); layer.activation_fn = nn.Identity()
         del layer_sd; gc.collect()
             
-    print("✅ Lean model ready.", flush=True)
+    print("Tying weights and finalizing...", flush=True)
+    model.tie_weights()
+    with torch.no_grad():
+        for p in model.parameters():
+            if torch.isnan(p).any(): p.data.zero_()
     model.eval()
-    
+
+    with torch.no_grad():
+        test_input = tokenizer("Hello", return_tensors="pt").to(DEVICE)
+        test_out = model(**test_input)
+        logits_max = test_out.logits.abs().max().item()
+        print(f"✅ Model 'Alive' Check: Max Logit Intensity = {logits_max:.2f}", flush=True)
+
+    assistant_model = None
+    if args.mode == "draft":
+        print("Initializing Assistant (OPT-125M) for Speculative Decoding...", flush=True)
+        asst_path = os.path.join(CACHE_PATH, "assistant")
+        load_id = asst_path if os.path.exists(os.path.join(asst_path, "pytorch_model.bin")) else ASST_ID
+        assistant_model = AutoModelForCausalLM.from_pretrained(load_id, torch_dtype=torch.float16, device_map=DEVICE)
+        assistant_model.eval()
+
     timer = StreamAndTimer(tokenizer, args.mode)
     print("\nREADY. Type 'exit' to quit.\n")
     
+    gen_kwargs = {
+        "max_new_tokens": 15, 
+        "streamer": timer, 
+        "do_sample": False,
+        "eos_token_id": tokenizer.eos_token_id,
+        "pad_token_id": tokenizer.eos_token_id,
+        "stopping_criteria": StoppingCriteriaList([WhitespaceStoppingCriteria(tokenizer)])
+    }
+
     if args.prompt:
-        inputs = tokenizer(args.prompt, return_tensors="pt").to(model.device)
+        inputs = tokenizer(args.prompt, return_tensors="pt").to(DEVICE)
         timer.start()
-        model.generate(**inputs, max_new_tokens=20, streamer=timer, do_sample=False)
+        if assistant_model: gen_kwargs["assistant_model"] = assistant_model
+        model.generate(**inputs, **gen_kwargs)
         timer.stop()
         return
 
@@ -243,9 +254,10 @@ def chat(args):
             try: user_input = input("YOU: ")
             except EOFError: print("\n[EOF] Ending benchmark."); break
             if user_input.lower() in ["quit", "exit"]: break
-            inputs = tokenizer(user_input, return_tensors="pt").to(model.device)
+            inputs = tokenizer(user_input, return_tensors="pt").to(DEVICE)
             timer.start()
-            model.generate(**inputs, max_new_tokens=20, streamer=timer, do_sample=False)
+            if assistant_model: gen_kwargs["assistant_model"] = assistant_model
+            model.generate(**inputs, **gen_kwargs)
             timer.stop()
         except KeyboardInterrupt: break
     if engine_ptr: lib.destroy_engine(engine_ptr)
@@ -254,7 +266,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--mode', choices=['predictor', 'oracle', 'naive', 'draft'], default='predictor')
     p.add_argument('--predictor', type=str); p.add_argument('--ffn_bin', type=str); p.add_argument('--layers', type=str); p.add_argument('--cache', type=str)
-    p.add_argument('--prompt', type=str, help="Run a single non-interactive prompt")
-    p.add_argument('--max_cache', type=int, default=1024, help="Max neurons to cache per layer (Memory-Latency tradeoff)")
+    p.add_argument('--prompt', type=str)
+    p.add_argument('--max_cache', type=int, default=1024)
     p.add_argument('--top_k', type=int, default=1024); p.add_argument('--threshold', type=float, default=0.2); p.add_argument('--window', type=int, default=5)
     chat(p.parse_args())

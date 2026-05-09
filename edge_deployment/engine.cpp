@@ -41,6 +41,10 @@ struct LayerCache {
     ~LayerCache() { delete[] active_weights; }
 };
 
+#ifndef DEFAULT_WINDOW_SIZE
+#define DEFAULT_WINDOW_SIZE 5
+#endif
+
 class FlashFFNEngine {
 private:
     uint8_t *ffn_mapped = nullptr;
@@ -56,9 +60,8 @@ public:
 private:
     int top_k = 1024;
     float threshold = 0.5f;
-    int window_size = 5;
+    int window_size = DEFAULT_WINDOW_SIZE;
     
-    // Architecture Config
     size_t hidden_size;
     size_t ffn_dim;
     size_t num_layers;
@@ -95,8 +98,7 @@ public:
 
         for(size_t i=0; i<num_layers; ++i) {
             caches.push_back(new LayerCache(max_cache_neurons, vals_per_cache_neuron)); 
-            int rank = (is_llama3 && i >= 28) ? 1024 : 128;
-            predictor_infos.push_back({0, rank});
+            predictor_infos.push_back({0, 128});
         }
     }
 
@@ -107,11 +109,8 @@ public:
     }
 
     void set_config(int k, float t, int w) { top_k = k; threshold = t; window_size = w; }
-
     void set_predictor_info(int layer_idx, int rank, size_t offset) {
-        if (layer_idx < (int)predictor_infos.size()) {
-            predictor_infos[layer_idx] = {offset, rank};
-        }
+        if (layer_idx < (int)predictor_infos.size()) predictor_infos[layer_idx] = {offset, rank};
     }
 
     inline float h2f(uint16_t h) {
@@ -127,17 +126,14 @@ public:
     }
 
     float dot_product(float* a, float* b, size_t len) {
-        float sum = 0.0f;
-        size_t j = 0;
+        float sum = 0.0f; size_t j = 0;
 #if defined(__ARM_NEON) || defined(__aarch64__)
         float32x4_t sum_vec = vdupq_n_f32(0.0f);
         for (; j + 3 < len; j += 4) {
-            float32x4_t a_vec = vld1q_f32(&a[j]);
-            float32x4_t b_vec = vld1q_f32(&b[j]);
+            float32x4_t a_vec = vld1q_f32(&a[j]); float32x4_t b_vec = vld1q_f32(&b[j]);
             sum_vec = vmlaq_f32(sum_vec, a_vec, b_vec);
         }
-        sum = vgetq_lane_f32(sum_vec, 0) + vgetq_lane_f32(sum_vec, 1) +
-              vgetq_lane_f32(sum_vec, 2) + vgetq_lane_f32(sum_vec, 3);
+        sum = vgetq_lane_f32(sum_vec, 0) + vgetq_lane_f32(sum_vec, 1) + vgetq_lane_f32(sum_vec, 2) + vgetq_lane_f32(sum_vec, 3);
 #endif
         for (; j < len; j++) sum += a[j] * b[j];
         return sum;
@@ -148,8 +144,7 @@ public:
 #if defined(__ARM_NEON) || defined(__aarch64__)
         float32x4_t scale_vec = vdupq_n_f32(scale);
         for (; j + 3 < len; j += 4) {
-            float32x4_t out_vec = vld1q_f32(&out[j]);
-            float32x4_t w_vec = vld1q_f32(&w[j]);
+            float32x4_t out_vec = vld1q_f32(&out[j]); float32x4_t w_vec = vld1q_f32(&w[j]);
             out_vec = vmlaq_f32(out_vec, w_vec, scale_vec);
             vst1q_f32(&out[j], out_vec);
         }
@@ -159,47 +154,41 @@ public:
 
     void execute_ffn(int layer_idx, float* in_batch, float* out_batch, int n_tokens, float* fc1_bias, int mode) {
         if (!ffn_mapped) return;
-        
         LayerCache* cache = caches[layer_idx];
         std::set<int> union_active_set;
 
-        // --- Step 1: PREDICTION ---
+        // Buffers to avoid per-neuron allocations
+        std::vector<float> w1_buf(hidden_size);
+        std::vector<float> w2_buf(hidden_size);
+
         if (mode == 0 && predictor_mapped) {
             auto& p_info = predictor_infos[layer_idx];
             float* down_w = predictor_mapped + p_info.offset;
             float* up_w = down_w + (p_info.rank * hidden_size);
-
             for (int t = 0; t < n_tokens; ++t) {
                 float* norm_x = in_batch + t * hidden_size;
                 std::vector<float> hidden(p_info.rank, 0.0f);
-                
                 #pragma omp parallel for
                 for (int i = 0; i < p_info.rank; i++) {
                     float sum = dot_product(down_w + i * hidden_size, norm_x, hidden_size);
                     hidden[i] = (sum > 0.0f) ? sum : 0.0f;
                 }
-
                 std::vector<std::pair<float, int>> scores(ffn_dim);
                 #pragma omp parallel for
                 for (size_t i = 0; i < ffn_dim; i++) {
                     float val = dot_product(up_w + i * p_info.rank, hidden.data(), p_info.rank);
                     scores[i] = {1.0f / (1.0f + std::exp(-val)), (int)i};
                 }
-
                 std::nth_element(scores.begin(), scores.begin() + std::min((int)ffn_dim, top_k), scores.end(),
                     [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
-                
                 for (int i = 0; i < std::min((int)ffn_dim, top_k); i++) union_active_set.insert(scores[i].second);
-                for (int i = top_k; i < (int)ffn_dim; i++) {
-                    if (scores[i].first > threshold) union_active_set.insert(scores[i].second);
-                }
+                for (int i = top_k; i < (int)ffn_dim; i++) if (scores[i].first > threshold) union_active_set.insert(scores[i].second);
             }
         } else if (mode == 2) { 
             for (int t = 0; t < n_tokens; ++t) {
                 float* x = in_batch + t * hidden_size;
                 uint8_t* layer_base = ffn_mapped + (size_t)layer_idx * ffn_dim * bytes_per_ssd_neuron;
                 std::vector<std::pair<float, int>> actual_scores(ffn_dim);
-                
                 #pragma omp parallel for
                 for (size_t n = 0; n < ffn_dim; ++n) {
                     uint16_t* src_h = (uint16_t*)(layer_base + (size_t)n * bytes_per_ssd_neuron);
@@ -208,22 +197,18 @@ public:
                     if (!is_llama3 && fc1_bias) sum += fc1_bias[n];
                     actual_scores[n] = {std::abs(sum), (int)n};
                 }
-
                 std::nth_element(actual_scores.begin(), actual_scores.begin() + std::min((int)ffn_dim, top_k), actual_scores.end(),
                     [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
-                
                 for (int i = 0; i < std::min((int)ffn_dim, top_k); i++) union_active_set.insert(actual_scores[i].second);
             }
         } else if (mode == 1 || (mode == 0 && !predictor_mapped)) {
             for (int i=0; i<(int)ffn_dim; ++i) union_active_set.insert(i);
         }
 
-        // --- Step 2: CACHE & SEQUENTIAL I/O ---
         if (mode == 0) {
             std::unordered_set<int> current_set(union_active_set.begin(), union_active_set.end());
             if (cache->window.size() >= (size_t)window_size) {
-                std::unordered_set<int> oldest = cache->window.front();
-                cache->window.pop_front();
+                std::unordered_set<int> oldest = cache->window.front(); cache->window.pop_front();
                 for (int n : oldest) {
                     bool needed = current_set.count(n);
                     if (!needed) { for (auto& win_set : cache->window) if (win_set.count(n)) { needed = true; break; } }
@@ -231,87 +216,62 @@ public:
                 }
             }
             cache->window.push_back(current_set);
-            for (int n : union_active_set) {
-                if (cache->neuron_to_slot.find(n) == cache->neuron_to_slot.end()) load_neuron_to_cache(layer_idx, cache, n, fc1_bias);
-            }
+            for (int n : union_active_set) if (cache->neuron_to_slot.find(n) == cache->neuron_to_slot.end()) load_neuron_to_cache(layer_idx, cache, n, fc1_bias);
         }
 
-        // --- Step 3: COMPUTE ---
         uint8_t* layer_base = ffn_mapped + (size_t)layer_idx * ffn_dim * bytes_per_ssd_neuron;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int t = 0; t < n_tokens; ++t) {
-            float* x = in_batch + t * hidden_size;
-            float* out = out_batch + t * hidden_size;
+            float* x = in_batch + t * hidden_size; float* out = out_batch + t * hidden_size;
             std::fill_n(out, hidden_size, 0.0f);
-
             if (mode == 0) {
                 for (int n : union_active_set) {
                     auto it = cache->neuron_to_slot.find(n);
                     if (it != cache->neuron_to_slot.end()) {
                         float* b = cache->active_weights + (it->second * vals_per_cache_neuron);
                         if (is_llama3) {
-                            float gate_act = dot_product(b, x, hidden_size);
-                            float up_act = dot_product(b + hidden_size, x, hidden_size);
-                            float silu_gate = gate_act / (1.0f + std::exp(-gate_act));
-                            float act = silu_gate * up_act;
+                            float gate_act = dot_product(b, x, hidden_size); float up_act = dot_product(b + hidden_size, x, hidden_size);
+                            float silu_gate = gate_act / (1.0f + std::exp(-gate_act)); float act = silu_gate * up_act;
                             add_scaled(out, b + hidden_size * 2, act, hidden_size);
                         } else {
-                            float act = b[hidden_size * 2]; // bias
-                            act += dot_product(b, x, hidden_size);
+                            float act = b[hidden_size * 2] + dot_product(b, x, hidden_size);
                             if(act > 0.0f) add_scaled(out, b + hidden_size, act, hidden_size);
                         }
-                    } else {
-                        compute_neuron_from_ssd(layer_base, n, x, out, fc1_bias ? fc1_bias[n] : 0.0f);
-                    }
+                    } else compute_neuron_from_ssd(layer_base, n, x, out, fc1_bias ? fc1_bias[n] : 0.0f, w1_buf.data(), w2_buf.data());
                 }
             } else {
-                for(size_t n = 0; n < ffn_dim; ++n) {
-                    compute_neuron_from_ssd(layer_base, n, x, out, fc1_bias ? fc1_bias[n] : 0.0f);
-                }
+                for(size_t n = 0; n < ffn_dim; ++n) compute_neuron_from_ssd(layer_base, n, x, out, fc1_bias ? fc1_bias[n] : 0.0f, w1_buf.data(), w2_buf.data());
             }
         }
     }
 
 private:
-    void compute_neuron_from_ssd(uint8_t* layer_base, int n, float* x, float* out, float bias) {
+    void compute_neuron_from_ssd(uint8_t* layer_base, int n, float* x, float* out, float bias, float* w1, float* w2) {
         uint16_t* src_h = (uint16_t*)(layer_base + (size_t)n * bytes_per_ssd_neuron);
-        std::vector<float> w1(hidden_size);
         for(size_t h=0; h<hidden_size; ++h) w1[h] = h2f(src_h[h]);
-        
         if (is_llama3) {
-            std::vector<float> w2(hidden_size);
-            std::vector<float> w3(hidden_size);
-            uint16_t* src_up = src_h + hidden_size;
-            uint16_t* src_down = src_h + hidden_size * 2;
-            for(size_t h=0; h<hidden_size; ++h) {
-                w2[h] = h2f(src_up[h]);
-                w3[h] = h2f(src_down[h]);
-            }
-            float gate_act = dot_product(w1.data(), x, hidden_size);
-            float up_act = dot_product(w2.data(), x, hidden_size);
-            float silu_gate = gate_act / (1.0f + std::exp(-gate_act));
-            float act = silu_gate * up_act;
-            add_scaled(out, w3.data(), act, hidden_size);
+            uint16_t* src_up = src_h + hidden_size; uint16_t* src_down = src_h + hidden_size * 2;
+            for(size_t h=0; h<hidden_size; ++h) w2[h] = h2f(src_up[h]);
+            float gate_act = dot_product(w1, x, hidden_size); float up_act = dot_product(w2, x, hidden_size);
+            float silu_gate = gate_act / (1.0f + std::exp(-gate_act)); float act = silu_gate * up_act;
+            for(size_t h=0; h<hidden_size; ++h) w1[h] = h2f(src_down[h]);
+            add_scaled(out, w1, act, hidden_size);
         } else {
-            float act = bias + dot_product(w1.data(), x, hidden_size);
+            float act = bias + dot_product(w1, x, hidden_size);
             if(act > 0.0f) {
-                std::vector<float> w2(hidden_size);
                 uint16_t* src_w2 = src_h + hidden_size;
                 for(size_t h=0; h<hidden_size; ++h) w2[h] = h2f(src_w2[h]);
-                add_scaled(out, w2.data(), act, hidden_size);
+                add_scaled(out, w2, act, hidden_size);
             }
         }
     }
 
     void evict_neuron(LayerCache* cache, int n) {
-        auto it = cache->neuron_to_slot.find(n);
-        if (it == cache->neuron_to_slot.end()) return;
+        auto it = cache->neuron_to_slot.find(n); if (it == cache->neuron_to_slot.end()) return;
         int slot = it->second; int last = cache->num_resident - 1;
         if (slot != last) {
             int last_n = cache->slot_to_neuron[last];
-            std::memcpy(cache->active_weights + slot * vals_per_cache_neuron, 
-                        cache->active_weights + last * vals_per_cache_neuron, 
-                        vals_per_cache_neuron * sizeof(float));
+            std::memcpy(cache->active_weights + slot * vals_per_cache_neuron, cache->active_weights + last * vals_per_cache_neuron, vals_per_cache_neuron * sizeof(float));
             cache->neuron_to_slot[last_n] = slot; cache->slot_to_neuron[slot] = last_n;
         }
         cache->neuron_to_slot.erase(n); cache->num_resident--;
@@ -321,7 +281,6 @@ private:
         if (cache->num_resident >= cache->max_resident) return; 
         uint16_t* src = (uint16_t*)(ffn_mapped + (size_t)l_idx*ffn_dim*bytes_per_ssd_neuron + (size_t)n*bytes_per_ssd_neuron);
         float* dst = cache->active_weights + (cache->num_resident * vals_per_cache_neuron);
-        
         for(size_t h=0; h<hidden_size; ++h) dst[h] = h2f(src[h]); 
         if (is_llama3) {
             for(size_t h=0; h<hidden_size; ++h) dst[h+hidden_size] = h2f(src[h+hidden_size]); 
@@ -336,15 +295,9 @@ private:
 };
 
 extern "C" {
-    void* init_engine(const char* ffn, const char* pred, size_t hs, size_t fd, size_t nl, int llama3, int max_cache) { 
-        return new FlashFFNEngine(ffn, pred, hs, fd, nl, llama3 != 0, max_cache); 
-    }
+    void* init_engine(const char* ffn, const char* pred, size_t hs, size_t fd, size_t nl, int llama3, int max_cache) { return new FlashFFNEngine(ffn, pred, hs, fd, nl, llama3 != 0, max_cache); }
     void set_engine_config(void* ptr, int k, float t, int w) { ((FlashFFNEngine*)ptr)->set_config(k, t, w); }
-    void set_predictor_layer_info(void* ptr, int l, int r, size_t o) {
-        ((FlashFFNEngine*)ptr)->set_predictor_info(l, r, o);
-    }
-    void execute_ffn_layer(void* ptr, int l, float* in, float* out, int n, float* b, int m) { 
-        ((FlashFFNEngine*)ptr)->execute_ffn(l, in, out, n, b, m); 
-    }
+    void set_predictor_layer_info(void* ptr, int l, int r, size_t o) { ((FlashFFNEngine*)ptr)->set_predictor_info(l, r, o); }
+    void execute_ffn_layer(void* ptr, int l, float* in, float* out, int n, float* b, int m) { ((FlashFFNEngine*)ptr)->execute_ffn(l, in, out, n, b, m); }
     void destroy_engine(void* ptr) { delete (FlashFFNEngine*)ptr; }
 }
