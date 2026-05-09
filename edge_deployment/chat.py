@@ -24,6 +24,8 @@ from accelerate.utils import set_module_tensor_to_device
 # --- 0. Setup & Silence ---
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["OPENBLAS_VERBOSE"] = "0"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
@@ -49,6 +51,14 @@ lib.execute_ffn_layer.argtypes = [
 ]
 lib.destroy_engine.argtypes = [ctypes.c_void_p]
 
+class ZeroModule(nn.Module):
+    def __init__(self, out_features):
+        super().__init__()
+        self.out_features = out_features
+    def forward(self, x):
+        # Return zeros matching the input shape to correctly skip FFN residual in OPT
+        return torch.zeros_like(x)
+
 def load_predictor_metadata(bin_path):
     if not bin_path: return None
     path_str = bin_path.decode() if isinstance(bin_path, bytes) else bin_path
@@ -65,7 +75,8 @@ class FlashFFN(nn.Module):
         self.engine_ptr = engine_ptr
         self.mode_int = mode_int
         self.fc1_bias_c = ctypes.cast(fc1_bias.data_ptr(), ctypes.POINTER(ctypes.c_float)) if fc1_bias is not None else None
-        self.fc2_bias = fc2_bias.to(DEVICE).half() if fc2_bias is not None else torch.zeros(HIDDEN_SIZE).to(DEVICE).half()
+        # Resident bias on CPU (FP16)
+        self.fc2_bias = fc2_bias.half() if fc2_bias is not None else torch.zeros(HIDDEN_SIZE).half()
 
     def forward(self, x):
         orig_shape = x.shape
@@ -148,7 +159,6 @@ def chat(args):
     print(f"Initializing {args.mode.upper()} Mode...")
     
     # --- OFFLINE LOADING FIX ---
-    # We must pass the FOLDER path, not the HUB ID, if we want to load from save_pretrained files.
     load_path = MODEL_ID
     if os.path.exists(os.path.join(CACHE_PATH, "config.json")):
         load_path = CACHE_PATH
@@ -175,17 +185,19 @@ def chat(args):
         mode_int = {"predictor": 0, "oracle": 2, "naive": 1, "draft": 0}[args.mode]
         
         config = AutoConfig.from_pretrained(load_path, cache_dir=CACHE_PATH, local_files_only=True)
-        with init_empty_weights(): model = AutoModelForCausalLM.from_config(config)
+        with init_empty_weights(): 
+            # FORCE FP16 for Edge Devices
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
         
         # Surgical Materialization to CPU
-        print("Materializing Model Structure to CPU...", flush=True)
+        print("Materializing Model Structure to CPU (FP16)...", flush=True)
         model.to_empty(device="cpu")
         print("✅ Structure ready.", flush=True)
         
         globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
         print("Loading global resident layers (Embeddings/Norms)...", flush=True)
         # Fix keys and load
-        clean_globals = {k.replace("model.", ""): v for k, v in globals_sd.items()}
+        clean_globals = {k.replace("model.", ""): v.half() for k, v in globals_sd.items()}
         model.load_state_dict(clean_globals, strict=False)
         
         print(f"Loading layers and patching ({args.mode.upper()})...", flush=True)
@@ -196,12 +208,14 @@ def chat(args):
             layer = model.model.decoder.layers[i]
             
             if args.mode == "draft" and i % 4 == 0:
-                layer.fc1 = nn.Identity()
+                # OPT residual: x = x + self.fc2(self.act(self.fc1(norm(x))))
+                # To skip, we must return 0 so the addition is a no-op
+                layer.fc1 = ZeroModule(16384)
                 layer.fc2 = nn.Identity()
                 layer.activation_fn = nn.Identity()
             else:
                 # Load Attention weights
-                clean_layer = {k.replace(f"decoder.layers.{i}.", ""): v for k, v in layer_sd.items() if "fc" not in k}
+                clean_layer = {k.replace(f"decoder.layers.{i}.", ""): v.half() for k, v in layer_sd.items() if "fc" not in k}
                 layer.load_state_dict(clean_layer, strict=False)
                 
                 fc1_b = layer_sd[f"decoder.layers.{i}.fc1.bias"].float().cpu().contiguous()
@@ -211,15 +225,9 @@ def chat(args):
                 layer.fc2 = nn.Identity(); layer.activation_fn = nn.Identity()
             del layer_sd; gc.collect()
             
-        # CRITICAL: Ensure NO parameters are left on 'meta' device or uninitialized
-        print("Finalizing model materialization...")
+        # Ensure NO parameters are left on 'meta' device or uninitialized
+        print("Finalizing model materialization...", flush=True)
         for name, p in model.named_parameters():
-            if p.device.type == 'meta':
-                # This should not happen after to_empty, but safety first
-                print(f"Warning: {name} still on meta! Forcing to CPU.")
-                # We can't easily move meta-tensor, so we replace it
-                # But to_empty(device="cpu") should have handled this.
-                pass
             if torch.isnan(p).any():
                 with torch.no_grad(): p.zero_()
 
