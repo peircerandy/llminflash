@@ -178,17 +178,20 @@ def chat(args):
         with init_empty_weights(): model = AutoModelForCausalLM.from_config(config)
         
         # Surgical Materialization to CPU
+        print("Materializing Model Structure to CPU...", flush=True)
         model.to_empty(device="cpu")
+        print("✅ Structure ready.", flush=True)
         
         globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
-        print("Materializing global layers (Embeddings/Norms)...")
+        print("Loading global resident layers (Embeddings/Norms)...", flush=True)
         # Fix keys and load
         clean_globals = {k.replace("model.", ""): v for k, v in globals_sd.items()}
         model.load_state_dict(clean_globals, strict=False)
         
-        print(f"Loading layers and patching ({args.mode.upper()})...")
+        print(f"Loading layers and patching ({args.mode.upper()})...", flush=True)
         for i in range(NUM_LAYERS):
-            if i % 8 == 0: print(f"  -> Patching Layer {i}/{NUM_LAYERS}...")
+            # Frequent heartbeats for slow SD cards
+            if i % 4 == 0: print(f"  -> Applying Flash Logic: Decoder Block {i}/{NUM_LAYERS}...", flush=True)
             layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu")
             layer = model.model.decoder.layers[i]
             
