@@ -28,6 +28,17 @@ def classify_edge(token_path, proto_path="benchmark_results/class_prototypes.pt"
     print(f"Prediction: {CLASS_NAMES[pred.item()]}")
     print(f"Confidence: {conf.item()*100:.2f}%")
     print("--------------------------------------\n")
+    
+    # Save results for graphing
+    res_path = token_path.replace(".npy", "_classification.json")
+    import json
+    with open(res_path, "w") as f:
+        json.dump({
+            "prediction": CLASS_NAMES[pred.item()],
+            "confidence": float(conf.item()),
+            "timestamp": os.path.getmtime(token_path)
+        }, f, indent=4)
+    print(f"Results saved to {res_path} for graphing.")
 
 if __name__ == "__main__":
     path = "edge_deployment/edge_output_cls_token.npy"
