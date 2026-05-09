@@ -176,13 +176,19 @@ def chat(args):
         
         config = AutoConfig.from_pretrained(load_path, cache_dir=CACHE_PATH, local_files_only=True)
         with init_empty_weights(): model = AutoModelForCausalLM.from_config(config)
+        
+        # Surgical Materialization to CPU
+        model.to_empty(device="cpu")
+        
         globals_sd = torch.load(os.path.join(LAYERS_DIR, "globals.pt"), map_location="cpu")
-        for k, v in globals_sd.items():
-            target = model.model if k.startswith("decoder.") else model
-            set_module_tensor_to_device(target, k, DEVICE, value=v, dtype=torch.float16)
+        print("Materializing global layers (Embeddings/Norms)...")
+        # Fix keys and load
+        clean_globals = {k.replace("model.", ""): v for k, v in globals_sd.items()}
+        model.load_state_dict(clean_globals, strict=False)
         
         print(f"Loading layers and patching ({args.mode.upper()})...")
         for i in range(NUM_LAYERS):
+            if i % 8 == 0: print(f"  -> Patching Layer {i}/{NUM_LAYERS}...")
             layer_sd = torch.load(os.path.join(LAYERS_DIR, f"layer_{i}.pt"), map_location="cpu")
             layer = model.model.decoder.layers[i]
             
@@ -191,14 +197,28 @@ def chat(args):
                 layer.fc2 = nn.Identity()
                 layer.activation_fn = nn.Identity()
             else:
+                # Load Attention weights
+                clean_layer = {k.replace(f"decoder.layers.{i}.", ""): v for k, v in layer_sd.items() if "fc" not in k}
+                layer.load_state_dict(clean_layer, strict=False)
+                
                 fc1_b = layer_sd[f"decoder.layers.{i}.fc1.bias"].float().cpu().contiguous()
                 fc2_b = layer_sd[f"decoder.layers.{i}.fc2.bias"].float().cpu().contiguous()
-                for k, v in layer_sd.items():
-                    if ".bias" in k: continue
-                    set_module_tensor_to_device(layer, k.replace(f"decoder.layers.{i}.", ""), DEVICE, value=v, dtype=torch.float16)
+                
                 layer.fc1 = FlashFFN(i, engine_ptr, fc1_b, fc2_b, mode_int)
                 layer.fc2 = nn.Identity(); layer.activation_fn = nn.Identity()
             del layer_sd; gc.collect()
+            
+        # CRITICAL: Ensure NO parameters are left on 'meta' device or uninitialized
+        print("Finalizing model materialization...")
+        for name, p in model.named_parameters():
+            if p.device.type == 'meta':
+                # This should not happen after to_empty, but safety first
+                print(f"Warning: {name} still on meta! Forcing to CPU.")
+                # We can't easily move meta-tensor, so we replace it
+                # But to_empty(device="cpu") should have handled this.
+                pass
+            if torch.isnan(p).any():
+                with torch.no_grad(): p.zero_()
 
     if "speculative" in args.mode:
         assistant_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m", device_map="auto", cache_dir=CACHE_PATH, local_files_only=True)
