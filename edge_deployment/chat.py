@@ -156,7 +156,9 @@ def chat(args):
     tokenizer = AutoTokenizer.from_pretrained(load_path, cache_dir=CACHE_PATH, local_files_only=True)
     
     pred_path = PREDICTOR_BIN_PATH
-    engine_ptr = lib.init_engine(FFN_BIN_PATH, pred_path, ctypes.c_size_t(HIDDEN_SIZE), ctypes.c_size_t(16384), ctypes.c_size_t(NUM_LAYERS), ctypes.c_int(0))
+    # Dynamic Cache Size: Default to 1024 to fit on 8GB systems
+    # 32 layers * 1024 neurons * 8193 vals * 4 bytes = 1.05 GB C++ overhead
+    engine_ptr = lib.init_engine(FFN_BIN_PATH, pred_path, ctypes.c_size_t(HIDDEN_SIZE), ctypes.c_size_t(16384), ctypes.c_size_t(NUM_LAYERS), ctypes.c_int(0), ctypes.c_int(args.max_cache))
     meta = load_predictor_metadata(pred_path)
     if meta:
         offset = 0
@@ -228,6 +230,14 @@ def chat(args):
     
     timer = StreamAndTimer(tokenizer, args.mode)
     print("\nREADY. Type 'exit' to quit.\n")
+    
+    if args.prompt:
+        inputs = tokenizer(args.prompt, return_tensors="pt").to(model.device)
+        timer.start()
+        model.generate(**inputs, max_new_tokens=20, streamer=timer, do_sample=False)
+        timer.stop()
+        return
+
     while True:
         try:
             try: user_input = input("YOU: ")
@@ -244,5 +254,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--mode', choices=['predictor', 'oracle', 'naive', 'draft'], default='predictor')
     p.add_argument('--predictor', type=str); p.add_argument('--ffn_bin', type=str); p.add_argument('--layers', type=str); p.add_argument('--cache', type=str)
+    p.add_argument('--prompt', type=str, help="Run a single non-interactive prompt")
+    p.add_argument('--max_cache', type=int, default=1024, help="Max neurons to cache per layer (Memory-Latency tradeoff)")
     p.add_argument('--top_k', type=int, default=1024); p.add_argument('--threshold', type=float, default=0.2); p.add_argument('--window', type=int, default=5)
     chat(p.parse_args())

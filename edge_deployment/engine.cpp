@@ -1,6 +1,6 @@
 /**
  * engine.cpp: High-performance C++ core with fine-grained parallelism.
- * Now with ARM NEON SIMD support and dynamic model architecture compatibility (OPT & Llama 3).
+ * Optimized for low-DRAM systems with configurable neuron caching.
  */
 
 #include <iostream>
@@ -68,12 +68,12 @@ private:
     size_t vals_per_cache_neuron;
 
 public:
-    FlashFFNEngine(const char* ffn_path, const char* predictor_path, size_t hs, size_t fd, size_t nl, bool llama3) 
+    FlashFFNEngine(const char* ffn_path, const char* predictor_path, size_t hs, size_t fd, size_t nl, bool llama3, int max_cache_neurons) 
         : hidden_size(hs), ffn_dim(fd), num_layers(nl), is_llama3(llama3) {
             
         vals_per_ssd_neuron = is_llama3 ? hidden_size * 3 : hidden_size * 2;
         bytes_per_ssd_neuron = vals_per_ssd_neuron * BYTES_PER_VAL;
-        vals_per_cache_neuron = (is_llama3 ? hidden_size * 3 : hidden_size * 2) + 1; // +1 for bias (if OPT)
+        vals_per_cache_neuron = (is_llama3 ? hidden_size * 3 : hidden_size * 2) + 1;
 
         int fd_ffn = open(ffn_path, O_RDONLY);
         if (fd_ffn != -1) {
@@ -93,14 +93,10 @@ public:
             }
         }
 
-        size_t current_p_offset = 0;
         for(size_t i=0; i<num_layers; ++i) {
-            caches.push_back(new LayerCache(4096, vals_per_cache_neuron)); 
-            // Hybrid Rank logic: only use 1024 for Llama 3 upper layers.
-            // Clay uses 128 for everything.
+            caches.push_back(new LayerCache(max_cache_neurons, vals_per_cache_neuron)); 
             int rank = (is_llama3 && i >= 28) ? 1024 : 128;
-            predictor_infos.push_back({current_p_offset, rank});
-            current_p_offset += (size_t)rank * hidden_size + (size_t)ffn_dim * rank;
+            predictor_infos.push_back({0, rank});
         }
     }
 
@@ -167,7 +163,7 @@ public:
         LayerCache* cache = caches[layer_idx];
         std::set<int> union_active_set;
 
-        // --- Step 1: PREDICTION (Highly Parallel) ---
+        // --- Step 1: PREDICTION ---
         if (mode == 0 && predictor_mapped) {
             auto& p_info = predictor_infos[layer_idx];
             float* down_w = predictor_mapped + p_info.offset;
@@ -177,14 +173,12 @@ public:
                 float* norm_x = in_batch + t * hidden_size;
                 std::vector<float> hidden(p_info.rank, 0.0f);
                 
-                // Parallel Hidden Pass
                 #pragma omp parallel for
                 for (int i = 0; i < p_info.rank; i++) {
                     float sum = dot_product(down_w + i * hidden_size, norm_x, hidden_size);
                     hidden[i] = (sum > 0.0f) ? sum : 0.0f;
                 }
 
-                // Parallel Output Pass
                 std::vector<std::pair<float, int>> scores(ffn_dim);
                 #pragma omp parallel for
                 for (size_t i = 0; i < ffn_dim; i++) {
@@ -192,16 +186,15 @@ public:
                     scores[i] = {1.0f / (1.0f + std::exp(-val)), (int)i};
                 }
 
-                // Top-K selection
-                std::nth_element(scores.begin(), scores.begin() + top_k, scores.end(),
+                std::nth_element(scores.begin(), scores.begin() + std::min((int)ffn_dim, top_k), scores.end(),
                     [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
                 
-                for (int i = 0; i < top_k; i++) union_active_set.insert(scores[i].second);
+                for (int i = 0; i < std::min((int)ffn_dim, top_k); i++) union_active_set.insert(scores[i].second);
                 for (int i = top_k; i < (int)ffn_dim; i++) {
                     if (scores[i].first > threshold) union_active_set.insert(scores[i].second);
                 }
             }
-        } else if (mode == 2) { // ORACLE MODE: Perfect Knowledge calculation
+        } else if (mode == 2) { 
             for (int t = 0; t < n_tokens; ++t) {
                 float* x = in_batch + t * hidden_size;
                 uint8_t* layer_base = ffn_mapped + (size_t)layer_idx * ffn_dim * bytes_per_ssd_neuron;
@@ -211,16 +204,15 @@ public:
                 for (size_t n = 0; n < ffn_dim; ++n) {
                     uint16_t* src_h = (uint16_t*)(layer_base + (size_t)n * bytes_per_ssd_neuron);
                     float sum = 0.0f;
-                    // Compute ground truth activation (Gate/FC1 only)
                     for(size_t h=0; h<hidden_size; ++h) sum += h2f(src_h[h]) * x[h];
                     if (!is_llama3 && fc1_bias) sum += fc1_bias[n];
                     actual_scores[n] = {std::abs(sum), (int)n};
                 }
 
-                std::nth_element(actual_scores.begin(), actual_scores.begin() + top_k, actual_scores.end(),
+                std::nth_element(actual_scores.begin(), actual_scores.begin() + std::min((int)ffn_dim, top_k), actual_scores.end(),
                     [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
                 
-                for (int i = 0; i < top_k; i++) union_active_set.insert(actual_scores[i].second);
+                for (int i = 0; i < std::min((int)ffn_dim, top_k); i++) union_active_set.insert(actual_scores[i].second);
             }
         } else if (mode == 1 || (mode == 0 && !predictor_mapped)) {
             for (int i=0; i<(int)ffn_dim; ++i) union_active_set.insert(i);
@@ -269,7 +261,6 @@ public:
                             if(act > 0.0f) add_scaled(out, b + hidden_size, act, hidden_size);
                         }
                     } else {
-                        // Fallback (should be rare if cache size is sufficient)
                         compute_neuron_from_ssd(layer_base, n, x, out, fc1_bias ? fc1_bias[n] : 0.0f);
                     }
                 }
@@ -331,13 +322,13 @@ private:
         uint16_t* src = (uint16_t*)(ffn_mapped + (size_t)l_idx*ffn_dim*bytes_per_ssd_neuron + (size_t)n*bytes_per_ssd_neuron);
         float* dst = cache->active_weights + (cache->num_resident * vals_per_cache_neuron);
         
-        for(size_t h=0; h<hidden_size; ++h) dst[h] = h2f(src[h]); // gate_proj / fc1
+        for(size_t h=0; h<hidden_size; ++h) dst[h] = h2f(src[h]); 
         if (is_llama3) {
-            for(size_t h=0; h<hidden_size; ++h) dst[h+hidden_size] = h2f(src[h+hidden_size]); // up_proj
-            for(size_t h=0; h<hidden_size; ++h) dst[h+hidden_size*2] = h2f(src[h+hidden_size*2]); // down_proj
-            dst[hidden_size*3] = 0.0f; // no bias
+            for(size_t h=0; h<hidden_size; ++h) dst[h+hidden_size] = h2f(src[h+hidden_size]); 
+            for(size_t h=0; h<hidden_size; ++h) dst[h+hidden_size*2] = h2f(src[h+hidden_size*2]); 
+            dst[hidden_size*3] = 0.0f;
         } else {
-            for(size_t h=0; h<hidden_size; ++h) dst[h+hidden_size] = h2f(src[h+hidden_size]); // fc2
+            for(size_t h=0; h<hidden_size; ++h) dst[h+hidden_size] = h2f(src[h+hidden_size]); 
             dst[hidden_size*2] = fc1_bias_layer ? fc1_bias_layer[n] : 0.0f;
         }
         cache->neuron_to_slot[n] = cache->num_resident; cache->slot_to_neuron[cache->num_resident] = n; cache->num_resident++;
@@ -345,8 +336,8 @@ private:
 };
 
 extern "C" {
-    void* init_engine(const char* ffn, const char* pred, size_t hs, size_t fd, size_t nl, int llama3) { 
-        return new FlashFFNEngine(ffn, pred, hs, fd, nl, llama3 != 0); 
+    void* init_engine(const char* ffn, const char* pred, size_t hs, size_t fd, size_t nl, int llama3, int max_cache) { 
+        return new FlashFFNEngine(ffn, pred, hs, fd, nl, llama3 != 0, max_cache); 
     }
     void set_engine_config(void* ptr, int k, float t, int w) { ((FlashFFNEngine*)ptr)->set_config(k, t, w); }
     void set_predictor_layer_info(void* ptr, int l, int r, size_t o) {
