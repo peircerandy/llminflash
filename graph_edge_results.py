@@ -122,8 +122,19 @@ def graph_comparison(results_dir="edge_results"):
                 if os.path.exists(h_path) and os.path.exists(img_path):
                     print(f"  -> Reconstructing Visual Proof for {dev}...")
                     h_map = np.load(h_path)
-                    rgb = Image.open(img_path).convert("RGB")
-                    rgb_np = np.array(rgb)
+                    
+                    if img_path.endswith(".npy"):
+                        ms_data = np.load(img_path)
+                        # Expecting (10, H, W) or (B, 10, H, W)
+                        if ms_data.ndim == 4: ms_data = ms_data[0]
+                        # Sentinel-2 RGB indices: Red=2, Green=1, Blue=0 in our 10-ch stack
+                        rgb_np = ms_data[[2, 1, 0], :, :].transpose(1, 2, 0)
+                        # Normalize for display
+                        rgb_np = (rgb_np - rgb_np.min()) / (rgb_np.max() - rgb_np.min() + 1e-8)
+                        rgb = Image.fromarray((rgb_np * 255).astype(np.uint8))
+                    else:
+                        rgb = Image.open(img_path).convert("RGB")
+                        rgb_np = np.array(rgb)
                     
                     fig_v, (ax_img, ax_h, ax_over) = plt.subplots(1, 3, figsize=(24, 8), facecolor='white')
                     ax_img.imshow(rgb); ax_img.set_title(f"INPUT ({dev})\nPred: {row.get('prediction', 'N/A')}", fontsize=24, fontweight='bold'); ax_img.axis('off')

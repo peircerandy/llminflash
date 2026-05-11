@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- LLM IN A FLASH: Edge Benchmark Suite ---
-IMAGE="sample_satellite.png"
+IMAGE="sample_satellite.npy"
 RUN_LLM=false
 RUN_CLAY=true
 USE_GCP=false
@@ -30,6 +30,12 @@ done
 echo "==============================================="
 echo "   STARTING EDGE DEPLOYMENT BENCHMARKS        "
 echo "==============================================="
+
+# --- 0. PREPARE DATA ---
+if [ ! -f "$IMAGE" ]; then
+    echo "Generating multispectral sample data..."
+    python3 generate_sample_ms.py
+fi
 
 # --- 1. CLAY BENCHMARKS ---
 if [ "$RUN_CLAY" = true ] ; then

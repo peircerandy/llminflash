@@ -89,19 +89,51 @@ def get_real_datacube(img_path):
     if not os.path.exists(img_path):
         print(f"Warning: {img_path} not found, using random noise.")
         return get_dummy_datacube()
-    img_pil = Image.open(img_path).convert("RGB")
-    preprocess = T.Compose([T.Resize((224, 224)), T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    tensor_img = preprocess(img_pil).unsqueeze(0)
-    bgr_img = tensor_img[:, [2, 1, 0], :, :]
-    padding = torch.zeros((1, 7, 224, 224))
-    pixels_10ch = torch.cat([bgr_img, padding], dim=1)
+    
+    if img_path.endswith(".npy"):
+        print(f"Loading multispectral data from {img_path}")
+        data = np.load(img_path)
+        # Ensure (B, C, H, W)
+        if len(data.shape) == 3:
+            pixels_10ch = torch.from_numpy(data).unsqueeze(0)
+        elif len(data.shape) == 4:
+            pixels_10ch = torch.from_numpy(data)
+        else:
+            raise ValueError(f"Unexpected NPY shape: {data.shape}")
+        
+        # Resize if necessary (Clay expects 224x224)
+        if pixels_10ch.shape[2:] != (224, 224):
+            print(f"Resizing input from {pixels_10ch.shape[2:]} to (224, 224)")
+            pixels_10ch = torch.nn.functional.interpolate(pixels_10ch, size=(224, 224), mode='bilinear', align_corners=False)
+
+        # Handle channel mismatch (metadata says 10)
+        if pixels_10ch.shape[1] != 10:
+            print(f"Warning: Model expects 10 bands, input has {pixels_10ch.shape[1]}. Adjusting.")
+            if pixels_10ch.shape[1] < 10:
+                pad = torch.zeros((pixels_10ch.shape[0], 10 - pixels_10ch.shape[1], 224, 224))
+                pixels_10ch = torch.cat([pixels_10ch, pad], dim=1)
+            else:
+                pixels_10ch = pixels_10ch[:, :10, :, :]
+
+        # Normalization for Sentinel-2 L2A (from metadata.yaml)
+        ms_mean = torch.tensor([1105., 1355., 1552., 1887., 2422., 2630., 2743., 2785., 2388., 1835.]).view(1, 10, 1, 1)
+        ms_std = torch.tensor([1809., 1757., 1888., 1870., 1732., 1697., 1742., 1648., 1470., 1379.]).view(1, 10, 1, 1)
+        pixels_10ch = (pixels_10ch.float() - ms_mean) / ms_std
+    else:
+        img_pil = Image.open(img_path).convert("RGB")
+        preprocess = T.Compose([T.Resize((224, 224)), T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        tensor_img = preprocess(img_pil).unsqueeze(0)
+        bgr_img = tensor_img[:, [2, 1, 0], :, :]
+        padding = torch.zeros((1, 7, 224, 224))
+        pixels_10ch = torch.cat([bgr_img, padding], dim=1)
+    
     waves = torch.tensor([490.0, 560.0, 665.0, 705.0, 740.0, 783.0, 842.0, 865.0, 1610.0, 2190.0])
     return {"pixels": pixels_10ch, "waves": waves, "latlon": torch.zeros((1, 4)), "time": torch.zeros((1, 4)), "gsd": torch.tensor([10.0]), "platform": ["sentinel-2-l2a"]}
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", type=str, default="sample_satellite.png", help="Path to input image")
+    parser.add_argument("--image", type=str, default="sample_satellite.npy", help="Path to input image or .npy multispectral data")
     parser.add_argument("--mode", type=str, choices=["predictor", "draft", "dense"], default="predictor", help="Flash mode or Dense baseline")
     args = parser.parse_args()
 

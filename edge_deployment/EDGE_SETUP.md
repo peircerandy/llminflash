@@ -93,16 +93,23 @@ sudo dphys-swapfile setup
 sudo dphys-swapfile swapon
 ```
 
-### 📸 Using the Raspberry Pi Camera
-You can pipe a fresh photo directly from the Pi Camera into the model:
+### 📸 Using Satellite Data
+You can pipe either a standard photo or raw multispectral data into the model:
 
-1. **Capture a photo:**
+1. **Capture a photo (Pi Camera):**
    ```bash
    libcamera-still -o test_capture.jpg
    ```
-2. **Run inference:**
+2. **Use Multispectral Data (.npy):**
+   If you have a 10-channel or 13-channel `.npy` array (e.g. from Sentinel-2), our script handles it automatically.
+   
+3. **Run inference:**
    ```bash
+   # For standard images:
    python edge_clay.py --image test_capture.jpg
+   
+   # For raw multispectral data:
+   python edge_clay.py --image my_sentinel_data.npy
    ```
 
 ### ⚠️ Troubleshooting the "OpenMP Loop" Hang
